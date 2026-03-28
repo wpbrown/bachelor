@@ -1,5 +1,7 @@
-//! # bachelor
-//!
-//! Pure single-threaded utilities optimized for thread-per-core executors.
-//!
-//! This crate is currently under active development.
+pub mod broadcast;
+pub mod channel;
+pub mod error;
+pub mod signal;
+pub mod watch;
+
+mod core;
