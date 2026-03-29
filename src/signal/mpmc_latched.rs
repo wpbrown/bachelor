@@ -7,11 +7,11 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 pub struct MpmcLatchedSignalConsumerKey {
-    last_generation: usize,
+    last_generation: u64,
 }
 
 pub struct MpmcLatchedSignal {
-    generation: Cell<usize>,
+    generation: Cell<u64>,
     wakers: RefCell<Slab<Waker>>,
 }
 
@@ -29,12 +29,15 @@ impl MpmcLatchedSignal {
         }
     }
 
-    pub fn generation(&self) -> usize {
+    pub fn generation(&self) -> u64 {
         self.generation.get()
     }
 
     pub fn notify(&self) {
-        self.generation.set(self.generation.get().wrapping_add(1));
+        self.generation
+            .set(self.generation.get().checked_add(1).expect(
+                "latched signal generation overflowed u64",
+            ));
         self.wake_all();
     }
 

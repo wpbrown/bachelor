@@ -7,15 +7,15 @@ use std::task::{Context, Poll, Waker};
 
 use crate::error::Closed;
 
-const CLOSED_BIT: usize = 1;
-const STEP_SIZE: usize = 2;
+const CLOSED_BIT: u64 = 1;
+const STEP_SIZE: u64 = 2;
 
 pub struct MpmcFiniteLatchedSignalConsumerKey {
-    last_generation: usize,
+    last_generation: u64,
 }
 
 pub struct MpmcFiniteLatchedSignal {
-    state: Cell<usize>,
+    state: Cell<u64>,
     wakers: RefCell<Slab<Waker>>,
 }
 
@@ -33,7 +33,7 @@ impl MpmcFiniteLatchedSignal {
         }
     }
 
-    pub fn generation(&self) -> usize {
+    pub fn generation(&self) -> u64 {
         self.state.get() & !CLOSED_BIT
     }
 
@@ -41,9 +41,16 @@ impl MpmcFiniteLatchedSignal {
         (self.state.get() & CLOSED_BIT) != 0
     }
 
-    pub fn notify(&self) {
-        self.state.set(self.state.get().wrapping_add(STEP_SIZE));
+    pub fn notify(&self) -> Result<(), Closed> {
+        if self.is_closed() {
+            return Err(Closed);
+        }
+        self.state
+            .set(self.state.get().checked_add(STEP_SIZE).expect(
+                "finite latched signal generation overflowed u64",
+            ));
         self.wake_all();
+        Ok(())
     }
 
     pub fn close(&self) {
@@ -130,14 +137,30 @@ impl Drop for Wait<'_, '_> {
 
 use std::rc::Rc;
 
+struct Inner {
+    signal: MpmcFiniteLatchedSignal,
+    producer_count: Cell<usize>,
+}
+
+impl Inner {
+    /// Number of receiver-side Rc holders (sources + consumers),
+    /// assuming `self` is about to be dropped by one of them.
+    fn receiver_count_after_drop(self: &Rc<Self>) -> usize {
+        Rc::strong_count(self) - 1 - self.producer_count.get()
+    }
+}
+
 pub fn signal() -> (
     MpmcFiniteLatchedSignalProducer,
     MpmcFiniteLatchedSignalSource,
 ) {
-    let inner = Rc::new(MpmcFiniteLatchedSignal::new());
+    let inner = Rc::new(Inner {
+        signal: MpmcFiniteLatchedSignal::new(),
+        producer_count: Cell::new(1),
+    });
     (
         MpmcFiniteLatchedSignalProducer {
-            inner: inner.clone(),
+            inner: Rc::clone(&inner),
         },
         MpmcFiniteLatchedSignalSource { inner },
     )
@@ -145,55 +168,91 @@ pub fn signal() -> (
 
 #[derive(Clone)]
 pub struct MpmcFiniteLatchedSignalSource {
-    inner: Rc<MpmcFiniteLatchedSignal>,
+    inner: Rc<Inner>,
 }
 
 impl MpmcFiniteLatchedSignalSource {
     pub fn subscribe(&self) -> MpmcFiniteLatchedSignalConsumer {
-        let key = self.inner.subscribe();
+        let key = self.inner.signal.subscribe();
         MpmcFiniteLatchedSignalConsumer {
-            inner: self.inner.clone(),
+            inner: Rc::clone(&self.inner),
             key,
         }
     }
 
     pub fn subscribe_forward(&self) -> MpmcFiniteLatchedSignalConsumer {
-        let key = self.inner.subscribe_forward();
+        let key = self.inner.signal.subscribe_forward();
         MpmcFiniteLatchedSignalConsumer {
-            inner: self.inner.clone(),
+            inner: Rc::clone(&self.inner),
             key,
         }
     }
 }
 
-#[derive(Clone)]
+impl Drop for MpmcFiniteLatchedSignalSource {
+    fn drop(&mut self) {
+        if self.inner.receiver_count_after_drop() == 0 {
+            self.inner.signal.close();
+        }
+    }
+}
+
 pub struct MpmcFiniteLatchedSignalProducer {
-    inner: Rc<MpmcFiniteLatchedSignal>,
+    inner: Rc<Inner>,
+}
+
+impl Clone for MpmcFiniteLatchedSignalProducer {
+    fn clone(&self) -> Self {
+        self.inner
+            .producer_count
+            .set(self.inner.producer_count.get() + 1);
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
+    }
 }
 
 impl MpmcFiniteLatchedSignalProducer {
-    pub fn notify(&self) {
-        self.inner.notify();
+    pub fn notify(&self) -> Result<(), Closed> {
+        self.inner.signal.notify()
     }
 
     pub fn close(&self) {
-        self.inner.close();
+        self.inner.signal.close();
+    }
+}
+
+impl Drop for MpmcFiniteLatchedSignalProducer {
+    fn drop(&mut self) {
+        let count = self.inner.producer_count.get() - 1;
+        self.inner.producer_count.set(count);
+        if count == 0 {
+            self.inner.signal.close();
+        }
     }
 }
 
 pub struct MpmcFiniteLatchedSignalConsumer {
-    inner: Rc<MpmcFiniteLatchedSignal>,
+    inner: Rc<Inner>,
     key: MpmcFiniteLatchedSignalConsumerKey,
 }
 
 impl MpmcFiniteLatchedSignalConsumer {
     pub fn observe(&mut self) -> Wait<'_, '_> {
-        self.inner.observe(&mut self.key)
+        self.inner.signal.observe(&mut self.key)
     }
 
     pub fn observe_forward(&mut self) -> Wait<'_, '_> {
-        self.key.last_generation = self.inner.generation();
-        self.inner.observe(&mut self.key)
+        self.key.last_generation = self.inner.signal.generation();
+        self.inner.signal.observe(&mut self.key)
+    }
+}
+
+impl Drop for MpmcFiniteLatchedSignalConsumer {
+    fn drop(&mut self) {
+        if self.inner.receiver_count_after_drop() == 0 {
+            self.inner.signal.close();
+        }
     }
 }
 
@@ -215,7 +274,7 @@ mod tests {
 
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
 
-        sig.notify();
+        sig.notify().unwrap();
         assert_eq!(wake_count.get(), 1);
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     }
@@ -241,7 +300,7 @@ mod tests {
         let sig = MpmcFiniteLatchedSignal::new();
         let mut key = sig.subscribe_forward();
 
-        sig.notify();
+        sig.notify().unwrap();
         sig.close();
 
         let (waker, _) = new_count_waker();
@@ -264,7 +323,7 @@ mod tests {
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
-        sig.notify();
+        sig.notify().unwrap();
 
         let mut f1 = Box::pin(sig.observe(&mut k1));
         assert_eq!(f1.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
@@ -285,7 +344,7 @@ mod tests {
     #[test]
     fn subscribe_vs_subscribe_forward() {
         let sig = MpmcFiniteLatchedSignal::new();
-        sig.notify();
+        sig.notify().unwrap();
 
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
@@ -306,7 +365,7 @@ mod tests {
         assert_eq!(sig.generation(), 0);
         assert!(!sig.is_closed());
 
-        sig.notify();
+        sig.notify().unwrap();
         assert_eq!(sig.generation(), 2);
         assert!(!sig.is_closed());
 
@@ -314,8 +373,8 @@ mod tests {
         assert_eq!(sig.generation(), 2);
         assert!(sig.is_closed());
 
-        sig.notify();
-        assert_eq!(sig.generation(), 4);
+        assert_eq!(sig.notify(), Err(Closed));
+        assert_eq!(sig.generation(), 2);
         assert!(sig.is_closed());
     }
 
@@ -331,8 +390,22 @@ mod tests {
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
         drop(fut);
 
-        sig.notify();
+        sig.notify().unwrap();
         assert_eq!(wake_count.get(), 0);
+    }
+
+    #[test]
+    fn notify_after_close_is_noop() {
+        let sig = MpmcFiniteLatchedSignal::new();
+        let mut key = sig.subscribe_forward();
+        sig.close();
+        assert_eq!(sig.notify(), Err(Closed));
+
+        let (waker, _) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut fut = Box::pin(sig.observe(&mut key));
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Err(Closed)));
     }
 
     #[test]
@@ -351,7 +424,7 @@ mod tests {
 
         sig.shrink_to_fit();
 
-        sig.notify();
+        sig.notify().unwrap();
         let mut fut = Box::pin(sig.observe(&mut key));
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     }

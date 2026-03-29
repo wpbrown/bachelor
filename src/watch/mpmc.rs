@@ -29,9 +29,12 @@ impl<T> MpmcWatchRef<T> {
     /// or [`update`](Self::update) on the same instance).
     /// Use [`get`](Self::get) / [`set`](Self::set) before or after the
     /// closure if you need additional access.
-    pub fn update(&self, f: impl FnOnce(&mut T)) {
+    pub fn update(&self, f: impl FnOnce(&mut T)) -> Result<(), Closed> {
+        if self.signal.is_closed() {
+            return Err(Closed);
+        }
         f(&mut self.data.borrow_mut());
-        self.signal.notify();
+        self.signal.notify()
     }
 
     /// Passes a shared reference to the stored value into `f` and returns
@@ -66,9 +69,12 @@ impl<T> MpmcWatchRef<T> {
     /// Panics if called while the value is borrowed, e.g. from inside a
     /// [`view`](Self::view) or [`update`](Self::update) closure on the
     /// same instance.
-    pub fn set(&self, value: T) {
+    pub fn set(&self, value: T) -> Result<(), Closed> {
+        if self.signal.is_closed() {
+            return Err(Closed);
+        }
         *self.data.borrow_mut() = value;
-        self.signal.notify();
+        self.signal.notify()
     }
 
     pub fn close(&self) {
@@ -104,6 +110,14 @@ struct Inner<T> {
     producer_count: Cell<usize>,
 }
 
+impl<T> Inner<T> {
+    /// Number of receiver-side Rc holders (sources + consumers),
+    /// assuming `self` is about to be dropped by one of them.
+    fn receiver_count_after_drop(self: &Rc<Self>) -> usize {
+        Rc::strong_count(self) - 1 - self.producer_count.get()
+    }
+}
+
 pub struct MpmcWatchRefProducer<T> {
     inner: Rc<Inner<T>>,
 }
@@ -125,8 +139,8 @@ impl<T> MpmcWatchRefProducer<T> {
     /// # Panics
     ///
     /// Panics if `f` re-entrantly borrows this watch.
-    pub fn update(&self, f: impl FnOnce(&mut T)) {
-        self.inner.watch.update(f);
+    pub fn update(&self, f: impl FnOnce(&mut T)) -> Result<(), Closed> {
+        self.inner.watch.update(f)
     }
 
     /// See [`MpmcWatchRef::view`] for details.
@@ -146,8 +160,8 @@ impl<T> MpmcWatchRefProducer<T> {
     }
 
     /// See [`MpmcWatchRef::set`].
-    pub fn set(&self, value: T) {
-        self.inner.watch.set(value);
+    pub fn set(&self, value: T) -> Result<(), Closed> {
+        self.inner.watch.set(value)
     }
 
     pub fn shrink_to_fit(&self) {
@@ -188,6 +202,14 @@ impl<T> MpmcWatchRefSource<T> {
     }
 }
 
+impl<T> Drop for MpmcWatchRefSource<T> {
+    fn drop(&mut self) {
+        if self.inner.receiver_count_after_drop() == 0 {
+            self.inner.watch.close();
+        }
+    }
+}
+
 pub struct MpmcWatchRefConsumer<T> {
     inner: Rc<Inner<T>>,
     key: MpmcWatchRefConsumerKey,
@@ -219,6 +241,14 @@ impl<T> MpmcWatchRefConsumer<T> {
     }
 }
 
+impl<T> Drop for MpmcWatchRefConsumer<T> {
+    fn drop(&mut self) {
+        if self.inner.receiver_count_after_drop() == 0 {
+            self.inner.watch.close();
+        }
+    }
+}
+
 pub fn watch<T>(initial: T) -> (MpmcWatchRefProducer<T>, MpmcWatchRefSource<T>) {
     let inner = Rc::new(Inner {
         watch: MpmcWatchRef::new(initial),
@@ -242,7 +272,7 @@ mod tests {
     #[test]
     fn update_and_view() {
         let w = MpmcWatchRef::new(0);
-        w.update(|v| *v = 42);
+        w.update(|v| *v = 42).unwrap();
         assert_eq!(w.view(|v| *v), 42);
     }
 
@@ -250,7 +280,7 @@ mod tests {
     fn get_clones_value() {
         let w = MpmcWatchRef::new(String::from("hello"));
         assert_eq!(w.get(), "hello");
-        w.update(|v| v.push_str(" world"));
+        w.update(|v| v.push_str(" world")).unwrap();
         assert_eq!(w.get(), "hello world");
     }
 
@@ -265,7 +295,7 @@ mod tests {
 
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
 
-        w.update(|v| *v = 1);
+        w.update(|v| *v = 1).unwrap();
         assert_eq!(wake_count.get(), 1);
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     }
@@ -296,7 +326,7 @@ mod tests {
 
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
 
-        w.update(|v| *v = 99);
+        w.update(|v| *v = 99).unwrap();
         w.close();
 
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
@@ -317,7 +347,7 @@ mod tests {
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
-        w.update(|v| *v = 1);
+        w.update(|v| *v = 1).unwrap();
 
         let mut f1 = Box::pin(w.observe(&mut k1));
         assert_eq!(f1.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
@@ -337,7 +367,7 @@ mod tests {
             let (tx, src) = watch(0);
             let mut rx = src.subscribe_forward();
 
-            tx.update(|v| *v = 42);
+            tx.update(|v| *v = 42).unwrap();
             rx.changed().await.unwrap();
 
             assert_eq!(rx.get(), 42);
@@ -350,7 +380,7 @@ mod tests {
             let (tx, src) = watch(0);
             let mut rx = src.subscribe_forward();
 
-            tx.update(|v| *v = 1);
+            tx.update(|v| *v = 1).unwrap();
             drop(tx);
 
             rx.changed().await.unwrap();
@@ -369,7 +399,7 @@ mod tests {
 
             drop(tx1);
 
-            tx2.update(|v| *v = 7);
+            tx2.update(|v| *v = 7).unwrap();
             rx.changed().await.unwrap();
             assert_eq!(rx.get(), 7);
         });
@@ -395,13 +425,13 @@ mod tests {
             let (tx, src) = watch(0);
             let mut rx1 = src.subscribe_forward();
 
-            tx.update(|v| *v = 1);
+            tx.update(|v| *v = 1).unwrap();
             rx1.changed().await.unwrap();
             assert_eq!(rx1.get(), 1);
 
             let mut rx2 = src.subscribe_forward();
 
-            tx.update(|v| *v = 2);
+            tx.update(|v| *v = 2).unwrap();
             rx1.changed().await.unwrap();
             rx2.changed().await.unwrap();
             assert_eq!(rx1.get(), 2);
@@ -414,7 +444,7 @@ mod tests {
         let (tx, src) = watch(0);
         let mut rx1 = src.subscribe_forward();
 
-        tx.update(|v| *v = 1);
+        tx.update(|v| *v = 1).unwrap();
 
         let mut rx2 = src.subscribe_forward();
 
@@ -432,7 +462,7 @@ mod tests {
     fn subscribe_sees_prior_changes() {
         let (tx, src) = watch(0);
 
-        tx.update(|v| *v = 1);
+        tx.update(|v| *v = 1).unwrap();
 
         let mut rx = src.subscribe();
 
@@ -459,7 +489,7 @@ mod tests {
         let mut cx2 = Context::from_waker(&waker2);
         assert_eq!(f2.as_mut().poll(&mut cx2), Poll::Pending);
 
-        tx.update(|v| *v = 1);
+        tx.update(|v| *v = 1).unwrap();
 
         assert_eq!(wake1.get(), 1);
         assert_eq!(wake2.get(), 1);

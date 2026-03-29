@@ -37,11 +37,15 @@ impl MpscFiniteLatchedSignal {
         }
     }
 
-    pub fn notify(&self) {
+    pub fn notify(&self) -> Result<(), Closed> {
+        if self.state.get().contains(Flags::CLOSED) {
+            return Err(Closed);
+        }
         self.state.set(self.state.get() | Flags::CHANGED);
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
+        Ok(())
     }
 
     pub fn close(&self) {
@@ -113,12 +117,25 @@ pub struct MpscFiniteLatchedSignalProducer {
 }
 
 impl MpscFiniteLatchedSignalProducer {
-    pub fn notify(&self) {
-        self.inner.notify();
+    pub fn notify(&self) -> Result<(), Closed> {
+        self.inner.notify()
     }
 
     pub fn close(&self) {
         self.inner.close();
+    }
+}
+
+impl Drop for MpscFiniteLatchedSignalProducer {
+    fn drop(&mut self) {
+        // The only Rc clones are held by producers and the single consumer.
+        // Count == 2 means self (about to drop) + consumer, i.e. this is
+        // the last producer. If a new type (e.g. a subscription source) is
+        // added that also clones the Rc, this check must be replaced with
+        // an explicit producer count.
+        if Rc::strong_count(&self.inner) == 2 {
+            self.inner.close();
+        }
     }
 }
 
@@ -129,6 +146,12 @@ pub struct MpscFiniteLatchedSignalConsumer {
 impl MpscFiniteLatchedSignalConsumer {
     pub fn observe(&mut self) -> Wait<'_> {
         self.inner.observe()
+    }
+}
+
+impl Drop for MpscFiniteLatchedSignalConsumer {
+    fn drop(&mut self) {
+        self.inner.close();
     }
 }
 
@@ -149,7 +172,7 @@ mod tests {
 
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
 
-        sig.notify();
+        sig.notify().unwrap();
         assert_eq!(wake_count.get(), 1);
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     }
@@ -173,7 +196,7 @@ mod tests {
     fn changed_before_closed_delivers_ok_first() {
         let sig = MpscFiniteLatchedSignal::new();
 
-        sig.notify();
+        sig.notify().unwrap();
         sig.close();
 
         let (waker, _) = new_count_waker();
@@ -196,7 +219,7 @@ mod tests {
 
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
 
-        sig.notify();
+        sig.notify().unwrap();
         sig.close();
 
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
@@ -208,7 +231,7 @@ mod tests {
     #[test]
     fn pre_signaled_changed_resolves_immediately() {
         let sig = MpscFiniteLatchedSignal::new();
-        sig.notify();
+        sig.notify().unwrap();
 
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
@@ -228,16 +251,29 @@ mod tests {
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
         drop(fut);
 
-        sig.notify();
+        sig.notify().unwrap();
         assert_eq!(wake_count.get(), 0);
+    }
+
+    #[test]
+    fn notify_after_close_is_noop() {
+        let sig = MpscFiniteLatchedSignal::new();
+        sig.close();
+        assert_eq!(sig.notify(), Err(Closed));
+
+        let (waker, _) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut fut = Box::pin(sig.observe());
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Err(Closed)));
     }
 
     #[test]
     fn multiple_changes_coalesce() {
         let sig = MpscFiniteLatchedSignal::new();
-        sig.notify();
-        sig.notify();
-        sig.notify();
+        sig.notify().unwrap();
+        sig.notify().unwrap();
+        sig.notify().unwrap();
 
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);

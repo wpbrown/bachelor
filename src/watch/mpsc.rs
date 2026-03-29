@@ -25,9 +25,12 @@ impl<T> MpscWatchRef<T> {
     /// or [`update`](Self::update) on the same instance).
     /// Use [`get`](Self::get) / [`set`](Self::set) before or after the
     /// closure if you need additional access.
-    pub fn update(&self, f: impl FnOnce(&mut T)) {
+    pub fn update(&self, f: impl FnOnce(&mut T)) -> Result<(), Closed> {
+        if self.signal.is_closed() {
+            return Err(Closed);
+        }
         f(&mut self.data.borrow_mut());
-        self.signal.notify();
+        self.signal.notify()
     }
 
     /// Passes a shared reference to the stored value into `f` and returns
@@ -62,9 +65,12 @@ impl<T> MpscWatchRef<T> {
     /// Panics if called while the value is borrowed, e.g. from inside a
     /// [`view`](Self::view) or [`update`](Self::update) closure on the
     /// same instance.
-    pub fn set(&self, value: T) {
+    pub fn set(&self, value: T) -> Result<(), Closed> {
+        if self.signal.is_closed() {
+            return Err(Closed);
+        }
         *self.data.borrow_mut() = value;
-        self.signal.notify();
+        self.signal.notify()
     }
 
     pub fn close(&self) {
@@ -101,8 +107,8 @@ impl<T> MpscWatchRefProducer<T> {
     /// # Panics
     ///
     /// Panics if `f` re-entrantly borrows this watch.
-    pub fn update(&self, f: impl FnOnce(&mut T)) {
-        self.inner.update(f);
+    pub fn update(&self, f: impl FnOnce(&mut T)) -> Result<(), Closed> {
+        self.inner.update(f)
     }
 
     /// See [`MpscWatchRef::view`] for details.
@@ -122,8 +128,8 @@ impl<T> MpscWatchRefProducer<T> {
     }
 
     /// See [`MpscWatchRef::set`].
-    pub fn set(&self, value: T) {
-        self.inner.set(value);
+    pub fn set(&self, value: T) -> Result<(), Closed> {
+        self.inner.set(value)
     }
 }
 
@@ -170,6 +176,12 @@ impl<T> MpscWatchRefConsumer<T> {
     }
 }
 
+impl<T> Drop for MpscWatchRefConsumer<T> {
+    fn drop(&mut self) {
+        self.inner.close();
+    }
+}
+
 pub fn watch<T>(initial: T) -> (MpscWatchRefProducer<T>, MpscWatchRefConsumer<T>) {
     let inner = Rc::new(MpscWatchRef::new(initial));
     let producer = MpscWatchRefProducer {
@@ -190,7 +202,7 @@ mod tests {
     #[test]
     fn update_and_view() {
         let w = MpscWatchRef::new(0);
-        w.update(|v| *v = 42);
+        w.update(|v| *v = 42).unwrap();
         assert_eq!(w.view(|v| *v), 42);
     }
 
@@ -198,7 +210,7 @@ mod tests {
     fn get_clones_value() {
         let w = MpscWatchRef::new(String::from("hello"));
         assert_eq!(w.get(), "hello");
-        w.update(|v| v.push_str(" world"));
+        w.update(|v| v.push_str(" world")).unwrap();
         assert_eq!(w.get(), "hello world");
     }
 
@@ -212,7 +224,7 @@ mod tests {
 
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
 
-        w.update(|v| *v = 1);
+        w.update(|v| *v = 1).unwrap();
         assert_eq!(wake_count.get(), 1);
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     }
@@ -241,7 +253,7 @@ mod tests {
 
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
 
-        w.update(|v| *v = 99);
+        w.update(|v| *v = 99).unwrap();
         w.close();
 
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
@@ -257,7 +269,7 @@ mod tests {
         block_on(async {
             let (tx, mut rx) = watch(0);
 
-            tx.update(|v| *v = 42);
+            tx.update(|v| *v = 42).unwrap();
             rx.changed().await.unwrap();
 
             assert_eq!(rx.get(), 42);
@@ -269,7 +281,7 @@ mod tests {
         block_on(async {
             let (tx, mut rx) = watch(0);
 
-            tx.update(|v| *v = 1);
+            tx.update(|v| *v = 1).unwrap();
             drop(tx);
 
             rx.changed().await.unwrap();
@@ -287,7 +299,7 @@ mod tests {
 
             drop(tx1);
 
-            tx2.update(|v| *v = 7);
+            tx2.update(|v| *v = 7).unwrap();
             rx.changed().await.unwrap();
             assert_eq!(rx.get(), 7);
         });
@@ -309,7 +321,7 @@ mod tests {
     #[test]
     fn consumer_view_delegates() {
         let (tx, rx) = watch(String::from("init"));
-        tx.update(|v| *v = String::from("updated"));
+        tx.update(|v| *v = String::from("updated")).unwrap();
         assert_eq!(rx.view(|v| v.len()), 7);
     }
 
@@ -331,7 +343,7 @@ mod tests {
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
         assert_eq!(wake_count.get(), 0);
 
-        tx.update(|v| *v = 1);
+        tx.update(|v| *v = 1).unwrap();
         assert_eq!(wake_count.get(), 1);
     }
 }

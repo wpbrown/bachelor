@@ -34,11 +34,6 @@ impl MpscLatchedSignal {
         }
     }
 
-    pub fn reset(&self) {
-        self.signaled.set(false);
-        self.waker.take();
-    }
-
     /// Returns a future that resolves when the signal is (or has been) notified.
     ///
     /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
@@ -50,7 +45,7 @@ impl MpscLatchedSignal {
     ///
     /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub fn observe_forward(&self) -> Wait<'_> {
-        self.reset();
+        self.signaled.set(false);
         self.observe()
     }
 }
@@ -114,5 +109,46 @@ impl MpscLatchedSignalConsumer {
 
     pub fn observe_forward(&mut self) -> Wait<'_> {
         self.inner.observe_forward()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use futures_test::task::new_count_waker;
+
+    #[test]
+    fn observe_forward_ignores_prior_signal() {
+        let sig = MpscLatchedSignal::new();
+        sig.notify();
+
+        let mut fut = Box::pin(sig.observe_forward());
+        let (waker, _) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
+
+        sig.notify();
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn observe_forward_does_not_clear_pending_waiter() {
+        let sig = MpscLatchedSignal::new();
+
+        let mut fut = Box::pin(sig.observe());
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
+
+        let ignored = sig.observe_forward();
+
+        sig.notify();
+        assert_eq!(wake_count.get(), 1);
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(()));
+
+        drop(ignored);
     }
 }
