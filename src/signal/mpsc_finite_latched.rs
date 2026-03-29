@@ -65,6 +65,17 @@ impl MpscFiniteLatchedSignal {
     pub fn observe(&self) -> Wait<'_> {
         Wait { signal: self }
     }
+
+    /// Like [`observe`](Self::observe), but ignores any prior change state.
+    ///
+    /// If the signal is already closed, the returned future still resolves
+    /// to [`Err(Closed)`](Err).
+    ///
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
+    pub fn observe_forward(&self) -> Wait<'_> {
+        self.state.set(self.state.get() - Flags::CHANGED);
+        self.observe()
+    }
 }
 
 pub struct Wait<'a> {
@@ -146,6 +157,10 @@ pub struct MpscFiniteLatchedSignalConsumer {
 impl MpscFiniteLatchedSignalConsumer {
     pub fn observe(&mut self) -> Wait<'_> {
         self.inner.observe()
+    }
+
+    pub fn observe_forward(&mut self) -> Wait<'_> {
+        self.inner.observe_forward()
     }
 }
 
@@ -238,6 +253,53 @@ mod tests {
 
         let mut fut = Box::pin(sig.observe());
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+    }
+
+    #[test]
+    fn observe_forward_ignores_prior_change() {
+        let sig = MpscFiniteLatchedSignal::new();
+        sig.notify().unwrap();
+
+        let mut fut = Box::pin(sig.observe_forward());
+        let (waker, _) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
+
+        sig.notify().unwrap();
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+    }
+
+    #[test]
+    fn observe_forward_preserves_closed_state() {
+        let sig = MpscFiniteLatchedSignal::new();
+        sig.notify().unwrap();
+        sig.close();
+
+        let mut fut = Box::pin(sig.observe_forward());
+        let (waker, _) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Err(Closed)));
+    }
+
+    #[test]
+    fn observe_forward_does_not_clear_pending_waiter() {
+        let sig = MpscFiniteLatchedSignal::new();
+
+        let mut fut = Box::pin(sig.observe());
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
+
+        let ignored = sig.observe_forward();
+
+        sig.notify().unwrap();
+        assert_eq!(wake_count.get(), 1);
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+
+        drop(ignored);
     }
 
     #[test]

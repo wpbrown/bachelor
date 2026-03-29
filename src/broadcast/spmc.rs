@@ -8,6 +8,10 @@ use std::task::Poll;
 use std::task::Waker;
 use std::{cell::Cell, cell::RefCell, num::NonZeroUsize, rc::Rc};
 
+/// Opaque raw consumer key returned by [`SpmcBroadcast::subscribe_raw`].
+///
+/// See the crate-level documentation on the [raw consumer key
+/// contract](crate#user-managed-consumer-state).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SpmcBroadcastConsumerKey(ConsumerKey);
 
@@ -157,10 +161,26 @@ impl<T> SpmcBroadcast<T> {
         }
     }
 
+    /// Creates a raw consumer subscription and returns its key.
+    ///
+    /// The returned key is valid until it is passed to
+    /// [`unsubscribe_raw`](Self::unsubscribe_raw). Reusing that key after
+    /// unsubscribe is a caller bug and may panic.
+    ///
+    /// Prefer [`subscribe_ref`](Self::subscribe_ref) or the split-handle
+    /// API if you do not need to store subscription state manually.
     pub fn subscribe_raw(&self) -> SpmcBroadcastConsumerKey {
         SpmcBroadcastConsumerKey(self.queue.borrow_mut().subscribe_with_context(None))
     }
 
+    /// Removes a raw consumer subscription.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is stale, already unsubscribed, or did not come
+    /// from a live subscription on this broadcast.
+    /// See the crate-level documentation on the [raw consumer key
+    /// contract](crate#user-managed-consumer-state).
     pub fn unsubscribe_raw(&self, id: SpmcBroadcastConsumerKey) {
         let gc_effect = self.queue.borrow_mut().unsubscribe(id.0);
         if gc_effect == RecvEffect::Unblocked
@@ -179,6 +199,11 @@ impl<T> SpmcBroadcast<T> {
     /// visitor closure, avoiding a clone.
     ///
     /// # Panics
+    ///
+    /// Panics if `id` is stale, already unsubscribed, or did not come
+    /// from a live subscription on this broadcast.
+    /// See the crate-level documentation on the [raw consumer key
+    /// contract](crate#user-managed-consumer-state).
     ///
     /// Panics if `visitor` re-entrantly borrows this channel (e.g. calls
     /// [`try_recv_ref_raw`](Self::try_recv_ref_raw),
@@ -217,6 +242,11 @@ impl<T> SpmcBroadcast<T> {
     ///
     /// # Panics
     ///
+    /// Panics if `id` is stale, already unsubscribed, or did not come
+    /// from a live subscription on this broadcast.
+    /// See the crate-level documentation on the [raw consumer key
+    /// contract](crate#user-managed-consumer-state).
+    ///
     /// Panics if `visitor` re-entrantly borrows this channel.
     /// See [`try_recv_ref_raw`](Self::try_recv_ref_raw) for details.
     ///
@@ -250,6 +280,14 @@ impl<T> SpmcBroadcast<T> {
 }
 
 impl<T: Clone> SpmcBroadcast<T> {
+    /// Attempts to receive the next item for a raw consumer subscription.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is stale, already unsubscribed, or did not come
+    /// from a live subscription on this broadcast.
+    /// See the crate-level documentation on the [raw consumer key
+    /// contract](crate#user-managed-consumer-state).
     pub fn try_recv_raw(&self, id: SpmcBroadcastConsumerKey) -> Result<Option<T>, Closed> {
         match self.queue.borrow_mut().try_recv(id.0) {
             Some((item, gc_effect)) => {
@@ -270,6 +308,13 @@ impl<T: Clone> SpmcBroadcast<T> {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if `id` is stale, already unsubscribed, or did not come
+    /// from a live subscription on this broadcast.
+    /// See the crate-level documentation on the [raw consumer key
+    /// contract](crate#user-managed-consumer-state).
+    ///
     /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub async fn recv_raw(&self, id: SpmcBroadcastConsumerKey) -> Result<T, Closed> {
         poll_fn(|cx| match self.try_recv_raw(id) {

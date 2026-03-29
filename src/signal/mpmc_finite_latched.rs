@@ -10,6 +10,15 @@ use crate::error::Closed;
 const CLOSED_BIT: u64 = 1;
 const STEP_SIZE: u64 = 2;
 
+/// Per-consumer observation state for [`MpmcFiniteLatchedSignal`].
+///
+/// A key represents one logical consumer's last observed generation.
+/// Create it with [`MpmcFiniteLatchedSignal::subscribe`] or
+/// [`MpmcFiniteLatchedSignal::subscribe_forward`] and pass it back to
+/// [`MpmcFiniteLatchedSignal::observe`].
+///
+/// This key is caller-managed consumer state, not an owned subscription
+/// handle. Keep one key per logical consumer.
 pub struct MpmcFiniteLatchedSignalConsumerKey {
     last_generation: u64,
 }
@@ -60,16 +69,23 @@ impl MpmcFiniteLatchedSignal {
         self.wake_all();
     }
 
+    /// Creates consumer state that observes any already-latched signal.
     pub fn subscribe(&self) -> MpmcFiniteLatchedSignalConsumerKey {
         MpmcFiniteLatchedSignalConsumerKey { last_generation: 0 }
     }
 
+    /// Creates consumer state that ignores already-latched signal state.
     pub fn subscribe_forward(&self) -> MpmcFiniteLatchedSignalConsumerKey {
         MpmcFiniteLatchedSignalConsumerKey {
             last_generation: self.generation(),
         }
     }
 
+    /// Returns a future for the next observation for `key`.
+    ///
+    /// `key` stores the caller-managed observation state for one logical
+    /// consumer. Reusing the same key for multiple consumers merges their
+    /// observation state.
     pub fn observe<'a, 'b>(
         &'a self,
         key: &'b mut MpmcFiniteLatchedSignalConsumerKey,

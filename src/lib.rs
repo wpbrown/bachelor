@@ -52,6 +52,28 @@
 //! use them directly, you must ensure that at most one async future is
 //! active per waker slot. Each core-type method that carries this
 //! requirement says so in its documentation.
+//!
+//! # User-managed consumer state
+//!
+//! Some low-level APIs expose caller-managed consumer state instead of
+//! owned consumer handles.
+//!
+//! There are two patterns:
+//!
+//! - Raw subscription identity keys, such as broadcast consumer keys.
+//!   These identify a live subscription inside the primitive. They are
+//!   only valid while that subscription is still live. Reusing a stale
+//!   key after unsubscribe is a caller bug and may panic.
+//! - Consumer cursor keys, such as the MPMC signal and watch keys.
+//!   These store per-consumer observation state in the key value itself
+//!   and are passed back into `observe`. They do not require an explicit
+//!   unsubscribe step, but they should still be treated as state owned by
+//!   one logical consumer and used with the primitive that created them.
+//!
+//! Use these low-level APIs only when you need to store or manage
+//! consumer state yourself. If you do not need that control, prefer the
+//! split handle APIs, which manage consumer lifetime automatically and
+//! avoid these manual contracts.
 
 pub mod broadcast;
 pub mod channel;

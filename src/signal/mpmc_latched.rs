@@ -6,6 +6,15 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+/// Per-consumer observation state for [`MpmcLatchedSignal`].
+///
+/// A key represents one logical consumer's last observed generation.
+/// Create it with [`MpmcLatchedSignal::subscribe`] or
+/// [`MpmcLatchedSignal::subscribe_forward`] and pass it back to
+/// [`MpmcLatchedSignal::observe`].
+///
+/// This key is caller-managed consumer state, not an owned subscription
+/// handle. Keep one key per logical consumer.
 pub struct MpmcLatchedSignalConsumerKey {
     last_generation: u64,
 }
@@ -53,16 +62,23 @@ impl MpmcLatchedSignal {
         }
     }
 
+    /// Creates consumer state that observes any already-latched signal.
     pub fn subscribe(&self) -> MpmcLatchedSignalConsumerKey {
         MpmcLatchedSignalConsumerKey { last_generation: 0 }
     }
 
+    /// Creates consumer state that ignores already-latched signal state.
     pub fn subscribe_forward(&self) -> MpmcLatchedSignalConsumerKey {
         MpmcLatchedSignalConsumerKey {
             last_generation: self.generation.get(),
         }
     }
 
+    /// Returns a future for the next observation for `key`.
+    ///
+    /// `key` stores the caller-managed observation state for one logical
+    /// consumer. Reusing the same key for multiple consumers merges their
+    /// observation state.
     pub fn observe<'a, 'b>(&'a self, key: &'b mut MpmcLatchedSignalConsumerKey) -> Wait<'a, 'b> {
         Wait {
             signal: self,

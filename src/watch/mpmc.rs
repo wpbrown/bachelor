@@ -5,6 +5,15 @@ use crate::signal::mpmc_finite_latched::{
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+/// Per-consumer observation state for [`MpmcWatchRef`].
+///
+/// A key represents one logical consumer's last observed change.
+/// Create it with [`MpmcWatchRef::subscribe`] or
+/// [`MpmcWatchRef::subscribe_forward`] and pass it back to
+/// [`MpmcWatchRef::observe`].
+///
+/// This key is caller-managed consumer state, not an owned subscription
+/// handle. Keep one key per logical consumer.
 pub struct MpmcWatchRefConsumerKey(MpmcFiniteLatchedSignalConsumerKey);
 
 pub struct MpmcWatchRef<T> {
@@ -85,14 +94,21 @@ impl<T> MpmcWatchRef<T> {
         self.signal.is_closed()
     }
 
+    /// Creates consumer state that observes any already-unseen change.
     pub fn subscribe(&self) -> MpmcWatchRefConsumerKey {
         MpmcWatchRefConsumerKey(self.signal.subscribe())
     }
 
+    /// Creates consumer state that ignores already-unseen changes.
     pub fn subscribe_forward(&self) -> MpmcWatchRefConsumerKey {
         MpmcWatchRefConsumerKey(self.signal.subscribe_forward())
     }
 
+    /// Returns a future for the next observation for `key`.
+    ///
+    /// `key` stores the caller-managed observation state for one logical
+    /// consumer. Reusing the same key for multiple consumers merges their
+    /// observation state.
     pub fn observe<'a, 'b>(
         &'a self,
         key: &'b mut MpmcWatchRefConsumerKey,

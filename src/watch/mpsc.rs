@@ -87,6 +87,17 @@ impl<T> MpscWatchRef<T> {
     pub fn observe(&self) -> mpsc_finite_latched::Wait<'_> {
         self.signal.observe()
     }
+
+    /// Like [`observe`](Self::observe), but ignores any already-latched
+    /// change state.
+    ///
+    /// If the watch is already closed, the returned future still resolves
+    /// to [`Err(Closed)`](Err).
+    ///
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
+    pub fn observe_forward(&self) -> mpsc_finite_latched::Wait<'_> {
+        self.signal.observe_forward()
+    }
 }
 
 pub struct MpscWatchRefProducer<T> {
@@ -153,6 +164,10 @@ pub struct MpscWatchRefConsumer<T> {
 impl<T> MpscWatchRefConsumer<T> {
     pub async fn changed(&mut self) -> Result<(), Closed> {
         self.inner.observe().await
+    }
+
+    pub async fn changed_forward(&mut self) -> Result<(), Closed> {
+        self.inner.observe_forward().await
     }
 
     pub fn is_closed(&self) -> bool {
@@ -227,6 +242,34 @@ mod tests {
         w.update(|v| *v = 1).unwrap();
         assert_eq!(wake_count.get(), 1);
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+    }
+
+    #[test]
+    fn observe_forward_ignores_prior_change() {
+        let w = MpscWatchRef::new(0);
+        w.update(|v| *v = 1).unwrap();
+
+        let mut fut = Box::pin(w.observe_forward());
+        let (waker, _) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
+
+        w.update(|v| *v = 2).unwrap();
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+    }
+
+    #[test]
+    fn observe_forward_preserves_closed_state() {
+        let w = MpscWatchRef::new(0);
+        w.update(|v| *v = 1).unwrap();
+        w.close();
+
+        let mut fut = Box::pin(w.observe_forward());
+        let (waker, _) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Err(Closed)));
     }
 
     #[test]
@@ -345,5 +388,20 @@ mod tests {
 
         tx.update(|v| *v = 1).unwrap();
         assert_eq!(wake_count.get(), 1);
+    }
+
+    #[test]
+    fn changed_forward_ignores_prior_change() {
+        let (tx, mut rx) = watch(0);
+        tx.update(|v| *v = 1).unwrap();
+
+        let mut fut = Box::pin(rx.changed_forward());
+        let (waker, _) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
+
+        tx.update(|v| *v = 2).unwrap();
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     }
 }
