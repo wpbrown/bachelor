@@ -20,11 +20,29 @@ impl<T> MpmcWatchRef<T> {
         }
     }
 
+    /// Applies `f` to the stored value and notifies all observers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `f` re-entrantly borrows this watch (e.g. calls
+    /// [`set`](Self::set), [`view`](Self::view), [`get`](Self::get),
+    /// or [`update`](Self::update) on the same instance).
+    /// Use [`get`](Self::get) / [`set`](Self::set) before or after the
+    /// closure if you need additional access.
     pub fn update(&self, f: impl FnOnce(&mut T)) {
         f(&mut self.data.borrow_mut());
         self.signal.notify();
     }
 
+    /// Passes a shared reference to the stored value into `f` and returns
+    /// the result.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `f` re-entrantly mutably borrows this watch (e.g. calls
+    /// [`update`](Self::update) or [`set`](Self::set) on the same
+    /// instance). Read-only calls such as [`get`](Self::get) or nested
+    /// [`view`](Self::view) calls are fine.
     pub fn view<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         f(&self.data.borrow())
     }
@@ -34,6 +52,23 @@ impl<T> MpmcWatchRef<T> {
         T: Clone,
     {
         self.data.borrow().clone()
+    }
+
+    /// Replaces the stored value and notifies all observers.
+    ///
+    /// This is the non-closure counterpart of [`update`](Self::update).
+    /// Together with [`get`](Self::get), it provides a way to read and
+    /// write without the re-entrancy constraints of the closure-based
+    /// API.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called while the value is borrowed, e.g. from inside a
+    /// [`view`](Self::view) or [`update`](Self::update) closure on the
+    /// same instance.
+    pub fn set(&self, value: T) {
+        *self.data.borrow_mut() = value;
+        self.signal.notify();
     }
 
     pub fn close(&self) {
@@ -85,10 +120,20 @@ impl<T> Clone for MpmcWatchRefProducer<T> {
 }
 
 impl<T> MpmcWatchRefProducer<T> {
+    /// See [`MpmcWatchRef::update`] for details.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `f` re-entrantly borrows this watch.
     pub fn update(&self, f: impl FnOnce(&mut T)) {
         self.inner.watch.update(f);
     }
 
+    /// See [`MpmcWatchRef::view`] for details.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `f` re-entrantly mutably borrows this watch.
     pub fn view<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         self.inner.watch.view(f)
     }
@@ -98,6 +143,11 @@ impl<T> MpmcWatchRefProducer<T> {
         T: Clone,
     {
         self.inner.watch.get()
+    }
+
+    /// See [`MpmcWatchRef::set`].
+    pub fn set(&self, value: T) {
+        self.inner.watch.set(value);
     }
 
     pub fn shrink_to_fit(&self) {
@@ -152,6 +202,11 @@ impl<T> MpmcWatchRefConsumer<T> {
         self.inner.watch.is_closed()
     }
 
+    /// See [`MpmcWatchRef::view`] for details.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `f` re-entrantly mutably borrows this watch.
     pub fn view<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         self.inner.watch.view(f)
     }

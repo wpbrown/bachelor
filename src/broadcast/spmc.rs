@@ -2,6 +2,7 @@ use crate::core::RecvEffect;
 use crate::core::broadcast_queue::BroadcastQueue;
 use crate::core::broadcast_queue::ConsumerKey;
 use crate::error::{Closed, TryRecvRefError, TrySendError};
+use smallvec::SmallVec;
 use std::future::poll_fn;
 use std::task::Poll;
 use std::task::Waker;
@@ -141,11 +142,19 @@ impl<T> SpmcBroadcast<T> {
     }
 
     fn wake_all_consumers(&self) {
-        self.queue.borrow_mut().for_each_consumer_mut(|context| {
-            if let Some(waker) = context.take() {
-                waker.wake();
-            }
-        });
+        let wakers: SmallVec<[Waker; 16]> = {
+            let mut queue = self.queue.borrow_mut();
+            let mut collected = SmallVec::new();
+            queue.for_each_consumer_mut(|context| {
+                if let Some(waker) = context.take() {
+                    collected.push(waker);
+                }
+            });
+            collected
+        };
+        for waker in wakers {
+            waker.wake();
+        }
     }
 
     pub fn subscribe_raw(&self) -> SpmcBroadcastConsumerKey {
@@ -166,6 +175,17 @@ impl<T> SpmcBroadcast<T> {
         SpmcBroadcastConsumerRef { channel: self, id }
     }
 
+    /// Attempts to receive the next item by passing a shared reference to the
+    /// visitor closure, avoiding a clone.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `visitor` re-entrantly borrows this channel (e.g. calls
+    /// [`try_recv_ref_raw`](Self::try_recv_ref_raw),
+    /// [`try_recv_raw`](Self::try_recv_raw), [`try_send`](Self::try_send),
+    /// or any other method that borrows the internal queue on the same
+    /// instance). Use [`try_recv_raw`](Self::try_recv_raw) (`T: Clone`)
+    /// if you need to access the channel inside the callback.
     pub fn try_recv_ref_raw<F, R>(
         &self,
         id: SpmcBroadcastConsumerKey,
@@ -193,6 +213,13 @@ impl<T> SpmcBroadcast<T> {
         }
     }
 
+    /// Async version of [`try_recv_ref_raw`](Self::try_recv_ref_raw).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `visitor` re-entrantly borrows this channel.
+    /// See [`try_recv_ref_raw`](Self::try_recv_ref_raw) for details.
+    ///
     /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub async fn recv_ref_raw<F, R>(
         &self,
@@ -258,6 +285,11 @@ impl<T: Clone> SpmcBroadcast<T> {
 }
 
 impl<'a, T> SpmcBroadcastConsumerRef<'a, T> {
+    /// See [`SpmcBroadcast::try_recv_ref_raw`] for details.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `visitor` re-entrantly borrows this channel.
     pub fn try_recv_ref<F, R>(&self, visitor: F) -> Result<R, TryRecvRefError<F>>
     where
         F: FnOnce(&T) -> R,
@@ -265,6 +297,11 @@ impl<'a, T> SpmcBroadcastConsumerRef<'a, T> {
         self.channel.try_recv_ref_raw(self.id, visitor)
     }
 
+    /// See [`SpmcBroadcast::recv_ref_raw`] for details.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `visitor` re-entrantly borrows this channel.
     pub async fn recv_ref<R>(&mut self, visitor: impl FnOnce(&T) -> R) -> Result<R, Closed> {
         self.channel.recv_ref_raw(self.id, visitor).await
     }
@@ -281,6 +318,11 @@ impl<'a, T: Clone> SpmcBroadcastConsumerRef<'a, T> {
 }
 
 impl<T> SpmcBroadcastConsumer<T> {
+    /// See [`SpmcBroadcast::try_recv_ref_raw`] for details.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `visitor` re-entrantly borrows this channel.
     pub fn try_recv_ref<F, R>(&self, visitor: F) -> Result<R, TryRecvRefError<F>>
     where
         F: FnOnce(&T) -> R,
@@ -288,6 +330,11 @@ impl<T> SpmcBroadcastConsumer<T> {
         self.inner.channel.try_recv_ref_raw(self.id, visitor)
     }
 
+    /// See [`SpmcBroadcast::recv_ref_raw`] for details.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `visitor` re-entrantly borrows this channel.
     pub async fn recv_ref<R>(&mut self, visitor: impl FnOnce(&T) -> R) -> Result<R, Closed> {
         self.inner.channel.recv_ref_raw(self.id, visitor).await
     }

@@ -1,4 +1,5 @@
 use slab::Slab;
+use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
@@ -78,9 +79,12 @@ impl MpmcFiniteLatchedSignal {
     }
 
     fn wake_all(&self) {
-        let wakers = self.wakers.borrow();
-        for (_, waker) in wakers.iter() {
-            waker.wake_by_ref();
+        let wakers: SmallVec<[Waker; 16]> = {
+            let mut slab = self.wakers.borrow_mut();
+            slab.iter_mut().map(|(_, w)| w.clone()).collect()
+        };
+        for waker in wakers {
+            waker.wake();
         }
     }
 }

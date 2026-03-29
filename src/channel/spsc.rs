@@ -100,11 +100,12 @@ impl<T> SpscChannel<T> {
     pub fn try_recv(&self) -> Result<Option<T>, Closed> {
         match self.queue.borrow_mut().try_recv() {
             Some((item, effect)) => {
-                if effect == RecvEffect::Unblocked {
-                    if let Some(waker) = self.producer_waker.take() {
-                        waker.wake();
-                    }
+                if effect == RecvEffect::Unblocked
+                    && let Some(waker) = self.producer_waker.take()
+                {
+                    waker.wake();
                 }
+
                 Ok(Some(item))
             }
             None => {
