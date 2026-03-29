@@ -506,7 +506,7 @@ mod tests {
     fn consumer_view_delegates() {
         let (tx, src) = watch(String::from("init"));
         let rx = src.subscribe_forward();
-        tx.update(|v| *v = String::from("updated"));
+        tx.update(|v| *v = String::from("updated")).unwrap();
         assert_eq!(rx.view(|v| v.len()), 7);
     }
 
@@ -517,13 +517,13 @@ mod tests {
             let mut rx = src.subscribe_forward();
 
             for i in 0..10 {
-                tx.update(|v| *v = i);
+                tx.update(|v| *v = i).unwrap();
                 rx.changed().await.unwrap();
             }
 
             tx.shrink_to_fit();
 
-            tx.update(|v| *v = 999);
+            tx.update(|v| *v = 999).unwrap();
             rx.changed().await.unwrap();
             assert_eq!(rx.get(), 999);
         });

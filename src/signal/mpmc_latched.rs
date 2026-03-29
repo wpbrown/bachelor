@@ -34,10 +34,12 @@ impl MpmcLatchedSignal {
     }
 
     pub fn notify(&self) {
-        self.generation
-            .set(self.generation.get().checked_add(1).expect(
-                "latched signal generation overflowed u64",
-            ));
+        self.generation.set(
+            self.generation
+                .get()
+                .checked_add(1)
+                .expect("latched signal generation overflowed u64"),
+        );
         self.wake_all();
     }
 
@@ -52,9 +54,7 @@ impl MpmcLatchedSignal {
     }
 
     pub fn subscribe(&self) -> MpmcLatchedSignalConsumerKey {
-        MpmcLatchedSignalConsumerKey {
-            last_generation: 0,
-        }
+        MpmcLatchedSignalConsumerKey { last_generation: 0 }
     }
 
     pub fn subscribe_forward(&self) -> MpmcLatchedSignalConsumerKey {
@@ -63,10 +63,7 @@ impl MpmcLatchedSignal {
         }
     }
 
-    pub fn observe<'a, 'b>(
-        &'a self,
-        key: &'b mut MpmcLatchedSignalConsumerKey,
-    ) -> Wait<'a, 'b> {
+    pub fn observe<'a, 'b>(&'a self, key: &'b mut MpmcLatchedSignalConsumerKey) -> Wait<'a, 'b> {
         Wait {
             signal: self,
             key,

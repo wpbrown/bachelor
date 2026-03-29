@@ -45,10 +45,12 @@ impl MpmcFiniteLatchedSignal {
         if self.is_closed() {
             return Err(Closed);
         }
-        self.state
-            .set(self.state.get().checked_add(STEP_SIZE).expect(
-                "finite latched signal generation overflowed u64",
-            ));
+        self.state.set(
+            self.state
+                .get()
+                .checked_add(STEP_SIZE)
+                .expect("finite latched signal generation overflowed u64"),
+        );
         self.wake_all();
         Ok(())
     }
@@ -59,9 +61,7 @@ impl MpmcFiniteLatchedSignal {
     }
 
     pub fn subscribe(&self) -> MpmcFiniteLatchedSignalConsumerKey {
-        MpmcFiniteLatchedSignalConsumerKey {
-            last_generation: 0,
-        }
+        MpmcFiniteLatchedSignalConsumerKey { last_generation: 0 }
     }
 
     pub fn subscribe_forward(&self) -> MpmcFiniteLatchedSignalConsumerKey {
