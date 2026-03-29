@@ -2,10 +2,11 @@ use crate::core::RecvEffect;
 use crate::core::bounded_queue::BoundedQueue;
 use slab::Slab;
 use std::cell::{Cell, RefCell};
-use std::future::poll_fn;
+use std::future::Future;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Poll, Waker};
+use std::task::{Context, Poll, Waker};
 
 pub use crate::error::{Closed, TrySendError};
 
@@ -48,8 +49,9 @@ impl<T> MpscChannel<T> {
         if let Some(waker) = self.consumer_waker.take() {
             waker.wake();
         }
-        for (_, slot) in self.producer_wakers.borrow_mut().iter_mut() {
-            if let Some(waker) = slot.take() {
+        let slab = self.producer_wakers.take();
+        for (_, slot) in slab {
+            if let Some(waker) = slot {
                 waker.wake();
             }
         }
@@ -74,50 +76,40 @@ impl<T> MpscChannel<T> {
         }
     }
 
-    pub async fn send(&self, item: T) -> Result<(), T> {
-        let mut item = Some(item);
-        let mut reg: Option<ProducerRegistration<'_, T>> = None;
-
-        poll_fn(|cx| {
-            let send_item = item.take().expect("send polled after completion");
-
-            match self.try_send(send_item) {
-                Ok(()) => Poll::Ready(Ok(())),
-                Err(TrySendError::Closed(returned_item)) => Poll::Ready(Err(returned_item)),
-                Err(TrySendError::Full(returned_item)) => {
-                    item = Some(returned_item);
-                    let waker = cx.waker().clone();
-                    match &reg {
-                        Some(r) => r.update_waker(waker),
-                        None => reg = Some(self.register_producer(waker)),
-                    }
-                    Poll::Pending
-                }
-            }
-        })
-        .await
-    }
-
-    fn wake_one_producer(&self) {
-        let mut slab = self.producer_wakers.borrow_mut();
-        for (_, slot) in slab.iter_mut() {
-            if let Some(waker) = slot.take() {
-                waker.wake();
-                return;
-            }
+    pub fn send(&self, item: T) -> Send<'_, T> {
+        Send {
+            channel: self,
+            item: Some(item),
+            waker_key: None,
         }
     }
 
+    fn wake_one_producer(&self) {
+        let waker = {
+            let mut slab = self.producer_wakers.borrow_mut();
+            slab.iter_mut().find_map(|(_, slot)| slot.take())
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn register_producer(&self, waker: Waker) -> usize {
+        self.producer_wakers.borrow_mut().insert(Some(waker))
+    }
+
+    fn update_producer(&self, key: usize, waker: Waker) {
+        self.producer_wakers.borrow_mut()[key] = Some(waker);
+    }
+
     fn unregister_producer(&self, key: usize) {
+        if self.closed.get() {
+            return;
+        }
         self.producer_wakers.borrow_mut().remove(key);
         if !self.queue.borrow().is_full() {
             self.wake_one_producer();
         }
-    }
-
-    fn register_producer(&self, waker: Waker) -> ProducerRegistration<'_, T> {
-        let key = self.producer_wakers.borrow_mut().insert(Some(waker));
-        ProducerRegistration { channel: self, key }
     }
 
     pub fn try_recv(&self) -> Result<Option<T>, Closed> {
@@ -165,20 +157,45 @@ impl<T> MpscChannel<T> {
     }
 }
 
-struct ProducerRegistration<'a, T> {
+pub struct Send<'a, T> {
     channel: &'a MpscChannel<T>,
-    key: usize,
+    item: Option<T>,
+    waker_key: Option<usize>,
 }
 
-impl<T> ProducerRegistration<'_, T> {
-    fn update_waker(&self, waker: Waker) {
-        self.channel.producer_wakers.borrow_mut()[self.key] = Some(waker);
+/// `Send` only stores `T` by value and never creates a self-referential borrow.
+impl<T> Unpin for Send<'_, T> {}
+
+impl<T> Future for Send<'_, T> {
+    type Output = Result<(), T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let send_item = this.item.take().expect("Send polled after completion");
+
+        match this.channel.try_send(send_item) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(TrySendError::Closed(returned_item)) => Poll::Ready(Err(returned_item)),
+            Err(TrySendError::Full(returned_item)) => {
+                this.item = Some(returned_item);
+                let waker = cx.waker().clone();
+                match this.waker_key {
+                    Some(key) => this.channel.update_producer(key, waker),
+                    None => {
+                        this.waker_key = Some(this.channel.register_producer(waker));
+                    }
+                }
+                Poll::Pending
+            }
+        }
     }
 }
 
-impl<T> Drop for ProducerRegistration<'_, T> {
+impl<T> Drop for Send<'_, T> {
     fn drop(&mut self) {
-        self.channel.unregister_producer(self.key);
+        if let Some(key) = self.waker_key {
+            self.channel.unregister_producer(key);
+        }
     }
 }
 
@@ -195,8 +212,8 @@ impl<T> MpscChannelProducer<T> {
         self.channel.try_send(item)
     }
 
-    pub async fn send(&self, item: T) -> Result<(), T> {
-        self.channel.send(item).await
+    pub fn send(&self, item: T) -> Send<'_, T> {
+        self.channel.send(item)
     }
 
     pub fn shrink_buffer_to_fit(&self) {
