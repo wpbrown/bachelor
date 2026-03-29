@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 pub struct MpmcLatchedSignalConsumerKey {
-    last_generation: Cell<usize>,
+    last_generation: usize,
 }
 
 pub struct MpmcLatchedSignal {
@@ -42,17 +42,20 @@ impl MpmcLatchedSignal {
 
     pub fn subscribe(&self) -> MpmcLatchedSignalConsumerKey {
         MpmcLatchedSignalConsumerKey {
-            last_generation: Cell::new(0),
+            last_generation: 0,
         }
     }
 
     pub fn subscribe_forward(&self) -> MpmcLatchedSignalConsumerKey {
         MpmcLatchedSignalConsumerKey {
-            last_generation: Cell::new(self.generation.get()),
+            last_generation: self.generation.get(),
         }
     }
 
-    pub fn observe<'a>(&'a self, key: &'a MpmcLatchedSignalConsumerKey) -> Wait<'a> {
+    pub fn observe<'a, 'b>(
+        &'a self,
+        key: &'b mut MpmcLatchedSignalConsumerKey,
+    ) -> Wait<'a, 'b> {
         Wait {
             signal: self,
             key,
@@ -65,21 +68,21 @@ impl MpmcLatchedSignal {
     }
 }
 
-pub struct Wait<'a> {
+pub struct Wait<'a, 'b> {
     signal: &'a MpmcLatchedSignal,
-    key: &'a MpmcLatchedSignalConsumerKey,
+    key: &'b mut MpmcLatchedSignalConsumerKey,
     waker_key: Option<usize>,
 }
 
-impl<'a> Future for Wait<'a> {
+impl Future for Wait<'_, '_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let current = this.signal.generation.get();
 
-        if current != this.key.last_generation.get() {
-            this.key.last_generation.set(current);
+        if current != this.key.last_generation {
+            this.key.last_generation = current;
             Poll::Ready(())
         } else {
             let waker = cx.waker().clone();
@@ -93,7 +96,7 @@ impl<'a> Future for Wait<'a> {
     }
 }
 
-impl Drop for Wait<'_> {
+impl Drop for Wait<'_, '_> {
     fn drop(&mut self) {
         if let Some(key) = self.waker_key {
             self.signal.wakers.borrow_mut().remove(key);
@@ -151,12 +154,12 @@ pub struct MpmcLatchedSignalConsumer {
 }
 
 impl MpmcLatchedSignalConsumer {
-    pub fn observe(&self) -> Wait<'_> {
-        self.inner.observe(&self.key)
+    pub fn observe(&mut self) -> Wait<'_, '_> {
+        self.inner.observe(&mut self.key)
     }
 
-    pub fn observe_forward(&self) -> Wait<'_> {
-        self.key.last_generation.set(self.inner.generation());
-        self.inner.observe(&self.key)
+    pub fn observe_forward(&mut self) -> Wait<'_, '_> {
+        self.key.last_generation = self.inner.generation();
+        self.inner.observe(&mut self.key)
     }
 }

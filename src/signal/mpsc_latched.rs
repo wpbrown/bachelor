@@ -4,6 +4,10 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+/// A single-consumer latched signal for async notification.
+///
+/// See the [single-waker contract](crate#single-waker-contract)
+/// before using this type directly.
 pub struct MpscLatchedSignal {
     waker: Cell<Option<Waker>>,
     signaled: Cell<bool>,
@@ -35,10 +39,16 @@ impl MpscLatchedSignal {
         self.waker.take();
     }
 
+    /// Returns a future that resolves when the signal is (or has been) notified.
+    ///
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub fn observe(&self) -> Wait<'_> {
         Wait { signal: self }
     }
 
+    /// Like [`observe`](Self::observe), but ignores any prior signal state.
+    ///
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub fn observe_forward(&self) -> Wait<'_> {
         self.reset();
         self.observe()
@@ -98,11 +108,11 @@ pub struct MpscLatchedSignalConsumer {
 }
 
 impl MpscLatchedSignalConsumer {
-    pub fn observe(&self) -> Wait<'_> {
+    pub fn observe(&mut self) -> Wait<'_> {
         self.inner.observe()
     }
 
-    pub fn observe_forward(&self) -> Wait<'_> {
+    pub fn observe_forward(&mut self) -> Wait<'_> {
         self.inner.observe_forward()
     }
 }

@@ -110,6 +110,7 @@ impl<T> SpmcBroadcast<T> {
         }
     }
 
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub async fn send(&self, item: T) -> Result<(), T> {
         let mut item = Some(item);
 
@@ -192,6 +193,7 @@ impl<T> SpmcBroadcast<T> {
         }
     }
 
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub async fn recv_ref_raw<F, R>(
         &self,
         id: SpmcBroadcastConsumerKey,
@@ -241,6 +243,7 @@ impl<T: Clone> SpmcBroadcast<T> {
         }
     }
 
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub async fn recv_raw(&self, id: SpmcBroadcastConsumerKey) -> Result<T, Closed> {
         poll_fn(|cx| match self.try_recv_raw(id) {
             Ok(Some(item)) => Poll::Ready(Ok(item)),
@@ -262,7 +265,7 @@ impl<'a, T> SpmcBroadcastConsumerRef<'a, T> {
         self.channel.try_recv_ref_raw(self.id, visitor)
     }
 
-    pub async fn recv_ref<R>(&self, visitor: impl FnOnce(&T) -> R) -> Result<R, Closed> {
+    pub async fn recv_ref<R>(&mut self, visitor: impl FnOnce(&T) -> R) -> Result<R, Closed> {
         self.channel.recv_ref_raw(self.id, visitor).await
     }
 }
@@ -272,7 +275,7 @@ impl<'a, T: Clone> SpmcBroadcastConsumerRef<'a, T> {
         self.channel.try_recv_raw(self.id)
     }
 
-    pub async fn recv(&self) -> Result<T, Closed> {
+    pub async fn recv(&mut self) -> Result<T, Closed> {
         self.channel.recv_raw(self.id).await
     }
 }
@@ -285,7 +288,7 @@ impl<T> SpmcBroadcastConsumer<T> {
         self.inner.channel.try_recv_ref_raw(self.id, visitor)
     }
 
-    pub async fn recv_ref<R>(&self, visitor: impl FnOnce(&T) -> R) -> Result<R, Closed> {
+    pub async fn recv_ref<R>(&mut self, visitor: impl FnOnce(&T) -> R) -> Result<R, Closed> {
         self.inner.channel.recv_ref_raw(self.id, visitor).await
     }
 }
@@ -295,7 +298,7 @@ impl<T: Clone> SpmcBroadcastConsumer<T> {
         self.inner.channel.try_recv_raw(self.id)
     }
 
-    pub async fn recv(&self) -> Result<T, Closed> {
+    pub async fn recv(&mut self) -> Result<T, Closed> {
         self.inner.channel.recv_raw(self.id).await
     }
 }
@@ -328,7 +331,7 @@ impl<T> SpmcBroadcastProducer<T> {
         self.inner.channel.try_send(item)
     }
 
-    pub async fn send(&self, item: T) -> Result<(), T> {
+    pub async fn send(&mut self, item: T) -> Result<(), T> {
         self.inner.channel.send(item).await
     }
 
@@ -438,7 +441,7 @@ mod tests {
     #[test]
     fn block_on_send_then_recv() {
         let channel = SpmcBroadcast::new(nz(2));
-        let consumer = channel.subscribe_ref();
+        let mut consumer = channel.subscribe_ref();
 
         block_on(async {
             channel.send(11).await.unwrap();
@@ -492,7 +495,7 @@ mod tests {
 
         channel.shrink_to_fit();
 
-        let consumer = channel.subscribe_ref();
+        let mut consumer = channel.subscribe_ref();
         block_on(async {
             channel.send(1234).await.unwrap();
             assert_eq!(consumer.recv().await, Ok(1234));
@@ -576,7 +579,7 @@ mod tests {
     #[test]
     fn block_on_send_then_recv_ref() {
         let channel = SpmcBroadcast::new(nz(2));
-        let consumer = channel.subscribe_ref();
+        let mut consumer = channel.subscribe_ref();
 
         block_on(async {
             channel.send(NoCopy(vec![42])).await.unwrap();
@@ -627,8 +630,8 @@ mod tests {
 
     #[test]
     fn channel_async_send_recv() {
-        let (producer, source) = broadcast(nz(2));
-        let consumer = source.subscribe();
+        let (mut producer, source) = broadcast(nz(2));
+        let mut consumer = source.subscribe();
 
         block_on(async {
             producer.send(42).await.unwrap();
@@ -771,8 +774,8 @@ mod tests {
 
     #[test]
     fn close_async_recv_drains_then_closed() {
-        let (producer, source) = broadcast(nz(4));
-        let consumer = source.subscribe();
+        let (mut producer, source) = broadcast(nz(4));
+        let mut consumer = source.subscribe();
 
         block_on(async {
             producer.send(1).await.unwrap();
@@ -789,7 +792,7 @@ mod tests {
     #[test]
     fn close_async_recv_ref_drains_then_closed() {
         let channel = SpmcBroadcast::new(nz(4));
-        let consumer = channel.subscribe_ref();
+        let mut consumer = channel.subscribe_ref();
 
         block_on(async {
             channel.send(NoCopy(vec![7])).await.unwrap();

@@ -14,6 +14,10 @@ bitflags! {
     }
 }
 
+/// A single-consumer latched signal with finite lifetime semantics.
+///
+/// See the [single-waker contract](crate#single-waker-contract)
+/// before using this type directly.
 pub struct MpscFiniteLatchedSignal {
     state: Cell<Flags>,
     waker: Cell<Option<Waker>>,
@@ -51,6 +55,9 @@ impl MpscFiniteLatchedSignal {
         self.state.get().contains(Flags::CLOSED)
     }
 
+    /// Returns a future that resolves when the signal changes or closes.
+    ///
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub fn observe(&self) -> Wait<'_> {
         Wait { signal: self }
     }
@@ -120,7 +127,7 @@ pub struct MpscFiniteLatchedSignalConsumer {
 }
 
 impl MpscFiniteLatchedSignalConsumer {
-    pub fn observe(&self) -> Wait<'_> {
+    pub fn observe(&mut self) -> Wait<'_> {
         self.inner.observe()
     }
 }

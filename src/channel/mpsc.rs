@@ -138,6 +138,7 @@ impl<T> MpscChannel<T> {
         }
     }
 
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub async fn recv(&self) -> Result<T, Closed> {
         std::future::poll_fn(|cx| match self.try_recv() {
             Ok(Some(item)) => Poll::Ready(Ok(item)),
@@ -213,6 +214,11 @@ impl<T> MpscChannelProducer<T> {
 
 impl<T> Drop for MpscChannelProducer<T> {
     fn drop(&mut self) {
+        // The only Rc clones are held by producers and the single consumer.
+        // Count == 2 means self (about to drop) + consumer, i.e. this is
+        // the last producer. If a new type (e.g. a subscription source) is
+        // added that also clones the Rc, this check must be replaced with
+        // an explicit producer count.
         if Rc::strong_count(&self.channel) == 2 {
             self.channel.close();
         }
@@ -224,7 +230,7 @@ impl<T> MpscChannelConsumer<T> {
         self.channel.try_recv()
     }
 
-    pub async fn recv(&self) -> Result<T, Closed> {
+    pub async fn recv(&mut self) -> Result<T, Closed> {
         self.channel.recv().await
     }
 }
@@ -467,7 +473,7 @@ mod tests {
 
     #[test]
     fn channel_async_send_recv() {
-        let (producer, consumer) = channel(nz(2));
+        let (producer, mut consumer) = channel(nz(2));
 
         block_on(async {
             producer.send(42).await.unwrap();
@@ -525,7 +531,7 @@ mod tests {
 
     #[test]
     fn close_async_recv_drains_then_closed() {
-        let (producer, consumer) = channel(nz(4));
+        let (producer, mut consumer) = channel(nz(4));
 
         block_on(async {
             producer.send(1).await.unwrap();
@@ -547,7 +553,7 @@ mod tests {
 
     #[test]
     fn multiple_producers_async() {
-        let (p1, consumer) = channel(nz(4));
+        let (p1, mut consumer) = channel(nz(4));
         let p2 = p1.clone();
 
         block_on(async {
@@ -563,7 +569,7 @@ mod tests {
 
     #[test]
     fn send_blocks_on_full_then_completes_after_recv() {
-        let (producer, consumer) = channel(nz(2));
+        let (producer, mut consumer) = channel(nz(2));
 
         block_on(async {
             producer.send(1).await.unwrap();
@@ -584,7 +590,7 @@ mod tests {
 
     #[test]
     fn shrink_to_fit_is_behaviorally_transparent() {
-        let (producer, consumer) = channel(nz(8));
+        let (producer, mut consumer) = channel(nz(8));
 
         block_on(async {
             for i in 0..64 {

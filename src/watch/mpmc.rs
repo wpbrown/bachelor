@@ -52,11 +52,11 @@ impl<T> MpmcWatchRef<T> {
         MpmcWatchRefConsumerKey(self.signal.subscribe_forward())
     }
 
-    pub fn observe<'a>(
+    pub fn observe<'a, 'b>(
         &'a self,
-        key: &'a MpmcWatchRefConsumerKey,
-    ) -> mpmc_finite_latched::Wait<'a> {
-        self.signal.observe(&key.0)
+        key: &'b mut MpmcWatchRefConsumerKey,
+    ) -> mpmc_finite_latched::Wait<'a, 'b> {
+        self.signal.observe(&mut key.0)
     }
 
     pub fn shrink_to_fit(&self) {
@@ -144,8 +144,8 @@ pub struct MpmcWatchRefConsumer<T> {
 }
 
 impl<T> MpmcWatchRefConsumer<T> {
-    pub async fn changed(&self) -> Result<(), Closed> {
-        self.inner.watch.observe(&self.key).await
+    pub async fn changed(&mut self) -> Result<(), Closed> {
+        self.inner.watch.observe(&mut self.key).await
     }
 
     pub fn is_closed(&self) -> bool {
@@ -202,9 +202,9 @@ mod tests {
     #[test]
     fn observe_resolves_on_update() {
         let w = MpmcWatchRef::new(0);
-        let key = w.subscribe_forward();
+        let mut key = w.subscribe_forward();
 
-        let mut fut = Box::pin(w.observe(&key));
+        let mut fut = Box::pin(w.observe(&mut key));
         let (waker, wake_count) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -218,9 +218,9 @@ mod tests {
     #[test]
     fn close_resolves_err() {
         let w = MpmcWatchRef::new(0);
-        let key = w.subscribe_forward();
+        let mut key = w.subscribe_forward();
 
-        let mut fut = Box::pin(w.observe(&key));
+        let mut fut = Box::pin(w.observe(&mut key));
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -233,9 +233,9 @@ mod tests {
     #[test]
     fn update_then_close_delivers_ok_then_err() {
         let w = MpmcWatchRef::new(0);
-        let key = w.subscribe_forward();
+        let mut key = w.subscribe_forward();
 
-        let mut fut = Box::pin(w.observe(&key));
+        let mut fut = Box::pin(w.observe(&mut key));
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -245,8 +245,9 @@ mod tests {
         w.close();
 
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(fut);
 
-        let mut fut2 = Box::pin(w.observe(&key));
+        let mut fut2 = Box::pin(w.observe(&mut key));
         assert_eq!(fut2.as_mut().poll(&mut cx), Poll::Ready(Err(Closed)));
 
         assert_eq!(w.get(), 99);
@@ -255,21 +256,23 @@ mod tests {
     #[test]
     fn multi_consumer_independence() {
         let w = MpmcWatchRef::new(0);
-        let k1 = w.subscribe_forward();
-        let k2 = w.subscribe_forward();
+        let mut k1 = w.subscribe_forward();
+        let mut k2 = w.subscribe_forward();
 
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
         w.update(|v| *v = 1);
 
-        let mut f1 = Box::pin(w.observe(&k1));
+        let mut f1 = Box::pin(w.observe(&mut k1));
         assert_eq!(f1.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(f1);
 
-        let mut f2 = Box::pin(w.observe(&k2));
+        let mut f2 = Box::pin(w.observe(&mut k2));
         assert_eq!(f2.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(f2);
 
-        let mut f1 = Box::pin(w.observe(&k1));
+        let mut f1 = Box::pin(w.observe(&mut k1));
         assert_eq!(f1.as_mut().poll(&mut cx), Poll::Pending);
     }
 
@@ -277,7 +280,7 @@ mod tests {
     fn channel_update_and_changed() {
         block_on(async {
             let (tx, src) = watch(0);
-            let rx = src.subscribe_forward();
+            let mut rx = src.subscribe_forward();
 
             tx.update(|v| *v = 42);
             rx.changed().await.unwrap();
@@ -290,7 +293,7 @@ mod tests {
     fn producer_drop_closes_channel() {
         block_on(async {
             let (tx, src) = watch(0);
-            let rx = src.subscribe_forward();
+            let mut rx = src.subscribe_forward();
 
             tx.update(|v| *v = 1);
             drop(tx);
@@ -306,7 +309,7 @@ mod tests {
     fn producer_clone_keeps_channel_open() {
         block_on(async {
             let (tx1, src) = watch(0);
-            let rx = src.subscribe_forward();
+            let mut rx = src.subscribe_forward();
             let tx2 = tx1.clone();
 
             drop(tx1);
@@ -321,7 +324,7 @@ mod tests {
     fn last_producer_clone_drop_closes() {
         block_on(async {
             let (tx1, src) = watch(0);
-            let rx = src.subscribe_forward();
+            let mut rx = src.subscribe_forward();
             let tx2 = tx1.clone();
 
             drop(tx1);
@@ -335,13 +338,13 @@ mod tests {
     fn source_subscribe_tracks_independently() {
         block_on(async {
             let (tx, src) = watch(0);
-            let rx1 = src.subscribe_forward();
+            let mut rx1 = src.subscribe_forward();
 
             tx.update(|v| *v = 1);
             rx1.changed().await.unwrap();
             assert_eq!(rx1.get(), 1);
 
-            let rx2 = src.subscribe_forward();
+            let mut rx2 = src.subscribe_forward();
 
             tx.update(|v| *v = 2);
             rx1.changed().await.unwrap();
@@ -354,11 +357,11 @@ mod tests {
     #[test]
     fn subscribe_forward_does_not_see_prior_unseen() {
         let (tx, src) = watch(0);
-        let rx1 = src.subscribe_forward();
+        let mut rx1 = src.subscribe_forward();
 
         tx.update(|v| *v = 1);
 
-        let rx2 = src.subscribe_forward();
+        let mut rx2 = src.subscribe_forward();
 
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
@@ -376,7 +379,7 @@ mod tests {
 
         tx.update(|v| *v = 1);
 
-        let rx = src.subscribe();
+        let mut rx = src.subscribe();
 
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
@@ -388,8 +391,8 @@ mod tests {
     #[test]
     fn changed_wakes_all_consumers() {
         let (tx, src) = watch(0);
-        let rx1 = src.subscribe_forward();
-        let rx2 = src.subscribe_forward();
+        let mut rx1 = src.subscribe_forward();
+        let mut rx2 = src.subscribe_forward();
 
         let mut f1 = Box::pin(rx1.changed());
         let (waker1, wake1) = new_count_waker();
@@ -426,7 +429,7 @@ mod tests {
     fn shrink_to_fit_is_transparent() {
         block_on(async {
             let (tx, src) = watch(0);
-            let rx = src.subscribe_forward();
+            let mut rx = src.subscribe_forward();
 
             for i in 0..10 {
                 tx.update(|v| *v = i);

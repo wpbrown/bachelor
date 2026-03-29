@@ -40,6 +40,9 @@ impl<T> MpscWatchRef<T> {
         self.signal.is_closed()
     }
 
+    /// Returns a future that resolves on the next change or closure.
+    ///
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub fn observe(&self) -> mpsc_finite_latched::Wait<'_> {
         self.signal.observe()
     }
@@ -76,6 +79,11 @@ impl<T> MpscWatchRefProducer<T> {
 
 impl<T> Drop for MpscWatchRefProducer<T> {
     fn drop(&mut self) {
+        // The only Rc clones are held by producers and the single consumer.
+        // Count == 2 means self (about to drop) + consumer, i.e. this is
+        // the last producer. If a new type (e.g. a subscription source) is
+        // added that also clones the Rc, this check must be replaced with
+        // an explicit producer count.
         if Rc::strong_count(&self.inner) == 2 {
             self.inner.close();
         }
@@ -87,7 +95,7 @@ pub struct MpscWatchRefConsumer<T> {
 }
 
 impl<T> MpscWatchRefConsumer<T> {
-    pub async fn changed(&self) -> Result<(), Closed> {
+    pub async fn changed(&mut self) -> Result<(), Closed> {
         self.inner.observe().await
     }
 
@@ -192,7 +200,7 @@ mod tests {
     #[test]
     fn channel_update_and_changed() {
         block_on(async {
-            let (tx, rx) = watch(0);
+            let (tx, mut rx) = watch(0);
 
             tx.update(|v| *v = 42);
             rx.changed().await.unwrap();
@@ -204,7 +212,7 @@ mod tests {
     #[test]
     fn producer_drop_closes_channel() {
         block_on(async {
-            let (tx, rx) = watch(0);
+            let (tx, mut rx) = watch(0);
 
             tx.update(|v| *v = 1);
             drop(tx);
@@ -219,7 +227,7 @@ mod tests {
     #[test]
     fn producer_clone_keeps_channel_open() {
         block_on(async {
-            let (tx1, rx) = watch(0);
+            let (tx1, mut rx) = watch(0);
             let tx2 = tx1.clone();
 
             drop(tx1);
@@ -233,7 +241,7 @@ mod tests {
     #[test]
     fn last_producer_clone_drop_closes() {
         block_on(async {
-            let (tx1, rx) = watch(0);
+            let (tx1, mut rx) = watch(0);
             let tx2 = tx1.clone();
 
             drop(tx1);
@@ -259,7 +267,7 @@ mod tests {
 
     #[test]
     fn changed_wakes_pending_consumer() {
-        let (tx, rx) = watch(0);
+        let (tx, mut rx) = watch(0);
 
         let mut fut = Box::pin(rx.changed());
         let (waker, wake_count) = new_count_waker();

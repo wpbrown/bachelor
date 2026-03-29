@@ -10,7 +10,7 @@ const CLOSED_BIT: usize = 1;
 const STEP_SIZE: usize = 2;
 
 pub struct MpmcFiniteLatchedSignalConsumerKey {
-    last_generation: Cell<usize>,
+    last_generation: usize,
 }
 
 pub struct MpmcFiniteLatchedSignal {
@@ -52,17 +52,20 @@ impl MpmcFiniteLatchedSignal {
 
     pub fn subscribe(&self) -> MpmcFiniteLatchedSignalConsumerKey {
         MpmcFiniteLatchedSignalConsumerKey {
-            last_generation: Cell::new(0),
+            last_generation: 0,
         }
     }
 
     pub fn subscribe_forward(&self) -> MpmcFiniteLatchedSignalConsumerKey {
         MpmcFiniteLatchedSignalConsumerKey {
-            last_generation: Cell::new(self.generation()),
+            last_generation: self.generation(),
         }
     }
 
-    pub fn observe<'a>(&'a self, key: &'a MpmcFiniteLatchedSignalConsumerKey) -> Wait<'a> {
+    pub fn observe<'a, 'b>(
+        &'a self,
+        key: &'b mut MpmcFiniteLatchedSignalConsumerKey,
+    ) -> Wait<'a, 'b> {
         Wait {
             signal: self,
             key,
@@ -82,13 +85,13 @@ impl MpmcFiniteLatchedSignal {
     }
 }
 
-pub struct Wait<'a> {
+pub struct Wait<'a, 'b> {
     signal: &'a MpmcFiniteLatchedSignal,
-    key: &'a MpmcFiniteLatchedSignalConsumerKey,
+    key: &'b mut MpmcFiniteLatchedSignalConsumerKey,
     waker_key: Option<usize>,
 }
 
-impl Future for Wait<'_> {
+impl Future for Wait<'_, '_> {
     type Output = Result<(), Closed>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -96,8 +99,8 @@ impl Future for Wait<'_> {
         let state = this.signal.state.get();
         let generation = state & !CLOSED_BIT;
 
-        if generation != this.key.last_generation.get() {
-            this.key.last_generation.set(generation);
+        if generation != this.key.last_generation {
+            this.key.last_generation = generation;
             Poll::Ready(Ok(()))
         } else if (state & CLOSED_BIT) != 0 {
             Poll::Ready(Err(Closed))
@@ -113,7 +116,7 @@ impl Future for Wait<'_> {
     }
 }
 
-impl Drop for Wait<'_> {
+impl Drop for Wait<'_, '_> {
     fn drop(&mut self) {
         if let Some(key) = self.waker_key {
             self.signal.wakers.borrow_mut().remove(key);
@@ -180,13 +183,13 @@ pub struct MpmcFiniteLatchedSignalConsumer {
 }
 
 impl MpmcFiniteLatchedSignalConsumer {
-    pub fn observe(&self) -> Wait<'_> {
-        self.inner.observe(&self.key)
+    pub fn observe(&mut self) -> Wait<'_, '_> {
+        self.inner.observe(&mut self.key)
     }
 
-    pub fn observe_forward(&self) -> Wait<'_> {
-        self.key.last_generation.set(self.inner.generation());
-        self.inner.observe(&self.key)
+    pub fn observe_forward(&mut self) -> Wait<'_, '_> {
+        self.key.last_generation = self.inner.generation();
+        self.inner.observe(&mut self.key)
     }
 }
 
@@ -200,9 +203,9 @@ mod tests {
     #[test]
     fn notify_resolves_ok() {
         let sig = MpmcFiniteLatchedSignal::new();
-        let key = sig.subscribe_forward();
+        let mut key = sig.subscribe_forward();
 
-        let mut fut = Box::pin(sig.observe(&key));
+        let mut fut = Box::pin(sig.observe(&mut key));
         let (waker, wake_count) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -216,9 +219,9 @@ mod tests {
     #[test]
     fn close_resolves_err() {
         let sig = MpmcFiniteLatchedSignal::new();
-        let key = sig.subscribe_forward();
+        let mut key = sig.subscribe_forward();
 
-        let mut fut = Box::pin(sig.observe(&key));
+        let mut fut = Box::pin(sig.observe(&mut key));
         let (waker, wake_count) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -232,7 +235,7 @@ mod tests {
     #[test]
     fn changed_before_closed_delivers_ok_first() {
         let sig = MpmcFiniteLatchedSignal::new();
-        let key = sig.subscribe_forward();
+        let mut key = sig.subscribe_forward();
 
         sig.notify();
         sig.close();
@@ -240,34 +243,38 @@ mod tests {
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
-        let mut fut = Box::pin(sig.observe(&key));
+        let mut fut = Box::pin(sig.observe(&mut key));
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(fut);
 
-        let mut fut = Box::pin(sig.observe(&key));
+        let mut fut = Box::pin(sig.observe(&mut key));
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Err(Closed)));
     }
 
     #[test]
     fn multi_consumer_independence() {
         let sig = MpmcFiniteLatchedSignal::new();
-        let k1 = sig.subscribe_forward();
-        let k2 = sig.subscribe_forward();
+        let mut k1 = sig.subscribe_forward();
+        let mut k2 = sig.subscribe_forward();
 
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
         sig.notify();
 
-        let mut f1 = Box::pin(sig.observe(&k1));
+        let mut f1 = Box::pin(sig.observe(&mut k1));
         assert_eq!(f1.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(f1);
 
-        let mut f2 = Box::pin(sig.observe(&k2));
+        let mut f2 = Box::pin(sig.observe(&mut k2));
         assert_eq!(f2.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(f2);
 
-        let mut f1 = Box::pin(sig.observe(&k1));
+        let mut f1 = Box::pin(sig.observe(&mut k1));
         assert_eq!(f1.as_mut().poll(&mut cx), Poll::Pending);
+        drop(f1);
 
-        let mut f2 = Box::pin(sig.observe(&k2));
+        let mut f2 = Box::pin(sig.observe(&mut k2));
         assert_eq!(f2.as_mut().poll(&mut cx), Poll::Pending);
     }
 
@@ -279,12 +286,12 @@ mod tests {
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
-        let k_old = sig.subscribe();
-        let mut fut = Box::pin(sig.observe(&k_old));
+        let mut k_old = sig.subscribe();
+        let mut fut = Box::pin(sig.observe(&mut k_old));
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
 
-        let k_new = sig.subscribe_forward();
-        let mut fut = Box::pin(sig.observe(&k_new));
+        let mut k_new = sig.subscribe_forward();
+        let mut fut = Box::pin(sig.observe(&mut k_new));
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
     }
 
@@ -311,9 +318,9 @@ mod tests {
     #[test]
     fn drop_clears_waker_slot() {
         let sig = MpmcFiniteLatchedSignal::new();
-        let key = sig.subscribe_forward();
+        let mut key = sig.subscribe_forward();
 
-        let mut fut = Box::pin(sig.observe(&key));
+        let mut fut = Box::pin(sig.observe(&mut key));
         let (waker, wake_count) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -327,13 +334,13 @@ mod tests {
     #[test]
     fn waker_slab_is_cleaned_up() {
         let sig = MpmcFiniteLatchedSignal::new();
-        let key = sig.subscribe_forward();
+        let mut key = sig.subscribe_forward();
 
         let (waker, _) = new_count_waker();
         let mut cx = Context::from_waker(&waker);
 
         for _ in 0..10 {
-            let mut fut = Box::pin(sig.observe(&key));
+            let mut fut = Box::pin(sig.observe(&mut key));
             assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
             drop(fut);
         }
@@ -341,7 +348,7 @@ mod tests {
         sig.shrink_to_fit();
 
         sig.notify();
-        let mut fut = Box::pin(sig.observe(&key));
+        let mut fut = Box::pin(sig.observe(&mut key));
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     }
 }

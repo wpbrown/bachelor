@@ -71,6 +71,7 @@ impl<T> SpscChannel<T> {
         }
     }
 
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub async fn send(&self, item: T) -> Result<(), T> {
         let mut item = Some(item);
 
@@ -116,6 +117,7 @@ impl<T> SpscChannel<T> {
         }
     }
 
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
     pub async fn recv(&self) -> Result<T, Closed> {
         poll_fn(|cx| match self.try_recv() {
             Ok(Some(item)) => Poll::Ready(Ok(item)),
@@ -138,7 +140,7 @@ impl<T> SpscChannelProducer<T> {
         self.channel.try_send(item)
     }
 
-    pub async fn send(&self, item: T) -> Result<(), T> {
+    pub async fn send(&mut self, item: T) -> Result<(), T> {
         self.channel.send(item).await
     }
 
@@ -158,7 +160,7 @@ impl<T> SpscChannelConsumer<T> {
         self.channel.try_recv()
     }
 
-    pub async fn recv(&self) -> Result<T, Closed> {
+    pub async fn recv(&mut self) -> Result<T, Closed> {
         self.channel.recv().await
     }
 }
@@ -319,7 +321,7 @@ mod tests {
 
     #[test]
     fn channel_async_send_recv() {
-        let (producer, consumer) = channel(nz(2));
+        let (mut producer, mut consumer) = channel(nz(2));
 
         block_on(async {
             producer.send(42).await.unwrap();
@@ -353,7 +355,7 @@ mod tests {
 
     #[test]
     fn close_async_recv_drains_then_closed() {
-        let (producer, consumer) = channel(nz(4));
+        let (mut producer, mut consumer) = channel(nz(4));
 
         block_on(async {
             producer.send(1).await.unwrap();
@@ -381,7 +383,7 @@ mod tests {
 
     #[test]
     fn send_blocks_on_full_then_completes_after_recv() {
-        let (producer, consumer) = channel(nz(2));
+        let (mut producer, mut consumer) = channel(nz(2));
 
         block_on(async {
             producer.send(1).await.unwrap();
@@ -402,7 +404,7 @@ mod tests {
 
     #[test]
     fn shrink_to_fit_is_behaviorally_transparent() {
-        let (producer, consumer) = channel(nz(8));
+        let (mut producer, mut consumer) = channel(nz(8));
 
         block_on(async {
             for i in 0..64 {
