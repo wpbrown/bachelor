@@ -24,17 +24,17 @@ Each primitive has a **two-level API**:
 
 ## Primitives
 
-| Core Type | Module | Topology | Description |
-|-----------|--------|----------|-------------|
-| `SpscChannel<T>` | `channel` | SPSC | Bounded async channel for single-producer, single-consumer communication. |
-| `MpscChannel<T>` | `channel` | MPSC | Bounded async channel supporting multiple cloneable producers and a single consumer. |
-| `SpmcBroadcast<T>` | `broadcast` | SPMC | Bounded broadcast channel where a single producer fans out each item to all subscribed consumers. Supports a visitor-based receive API to avoid cloning. |
-| `MpscLatchedSignal` | `signal` | MPSC | Latched notification signal. Multiple producers can notify a single consumer. Signal persists indefinitely. |
-| `MpscFiniteLatchedSignal` | `signal` | MPSC | Latched notification signal with finite lifetime. Auto-closes when all producers drop. |
-| `MpmcLatchedSignal` | `signal` | MPMC | Latched notification signal with generation tracking for multiple consumers. Signal persists indefinitely. |
-| `MpmcFiniteLatchedSignal` | `signal` | MPMC | Latched notification signal with generation tracking and finite lifetime. Auto-closes when all producers/sources drop. |
-| `MpscWatchRef<T>` | `watch` | MPSC | Shared mutable value with change notification for a single consumer. |
-| `MpmcWatchRef<T>` | `watch` | MPMC | Shared mutable value with per-consumer generation tracking and change notification. |
+| Core Type | Description |
+|-----------|-------------|
+| `SpscChannel<T>` | Bounded SPSC async channel. |
+| `MpscChannel<T>` | Bounded MPSC async channel with multiple cloneable producers. |
+| `SpmcBroadcast<T>` | Bounded SPMC broadcast channel that fans out each item to all subscribers. Supports visitor-based receive to avoid cloning. |
+| `MpscLatchedSignal` | MPSC latched notification signal. Persists indefinitely. |
+| `MpscFiniteLatchedSignal` | MPSC latched notification signal with finite lifetime. Auto-closes when all producers drop. |
+| `MpmcLatchedSignal` | MPMC latched notification signal with per-consumer generation tracking. Persists indefinitely. |
+| `MpmcFiniteLatchedSignal` | MPMC latched notification signal with generation tracking and finite lifetime. Auto-closes when all producers/sources drop. |
+| `MpscWatchRef<T>` | MPSC shared mutable value with change notification. |
+| `MpmcWatchRef<T>` | MPMC shared mutable value with per-consumer generation tracking and change notification. |
 
 ## Status
 
