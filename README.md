@@ -6,10 +6,9 @@ thread-per-core (TPC) architectures.
 ## Why bachelor?
 
 There are lots of great thread-safe async synchronization primitives available
-in the Rust ecosystem. Thread safety comes at a cost — atomics, `Arc`,
-cross-thread waker coordination — that we don't need to pay when running on a
-single-threaded executor. `bachelor` provides `Rc`/`Cell`-based alternatives
-that eliminate this overhead entirely.
+in the Rust ecosystem. Thread safety comes at a cost (atomics, `Arc`, `Mutex`)
+that we don't need to pay when running on a single-threaded executor. `bachelor`
+provides `Rc`/`Cell`-based alternatives that eliminate this overhead entirely.
 
 Each primitive has a **two-level API**:
 

@@ -1,6 +1,6 @@
 [package]
 name = "bachelor"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 description = "Pure single-threaded utilities optimized for thread-per-core executors"
 license = "MIT OR Apache-2.0"
