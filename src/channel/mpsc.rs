@@ -131,16 +131,8 @@ impl<T> MpscChannel<T> {
     }
 
     /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
-    pub async fn recv(&self) -> Result<T, Closed> {
-        std::future::poll_fn(|cx| match self.try_recv() {
-            Ok(Some(item)) => Poll::Ready(Ok(item)),
-            Err(Closed) => Poll::Ready(Err(Closed)),
-            Ok(None) => {
-                self.consumer_waker.set(Some(cx.waker().clone()));
-                Poll::Pending
-            }
-        })
-        .await
+    pub fn recv(&self) -> Recv<'_, T> {
+        Recv { channel: self }
     }
 
     pub fn shrink_buffer_to_fit(&self) {
@@ -196,6 +188,32 @@ impl<T> Drop for Send<'_, T> {
         if let Some(key) = self.waker_key {
             self.channel.unregister_producer(key);
         }
+    }
+}
+
+pub struct Recv<'a, T> {
+    channel: &'a MpscChannel<T>,
+}
+
+impl<T> Future for Recv<'_, T> {
+    type Output = Result<T, Closed>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.channel.try_recv() {
+            Ok(Some(item)) => Poll::Ready(Ok(item)),
+            Err(Closed) => Poll::Ready(Err(Closed)),
+            Ok(None) => {
+                this.channel.consumer_waker.set(Some(cx.waker().clone()));
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl<T> Drop for Recv<'_, T> {
+    fn drop(&mut self) {
+        self.channel.consumer_waker.take();
     }
 }
 
@@ -620,5 +638,21 @@ mod tests {
             producer.send(999).await.unwrap();
             assert_eq!(consumer.recv().await, Ok(999));
         });
+    }
+
+    #[test]
+    fn dropped_recv_future_clears_waker() {
+        let ch = MpscChannel::<i32>::new(nz(2));
+
+        let mut recv_fut = Box::pin(ch.recv());
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(recv_fut.as_mut().poll(&mut cx), Poll::Pending);
+        drop(recv_fut);
+
+        // Waker was cleared by Drop, so close should not wake it.
+        ch.close();
+        assert_eq!(wake_count.get(), 0);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "bachelor"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 description = "Pure single-threaded utilities optimized for thread-per-core executors"
 license = "MIT OR Apache-2.0"
@@ -10,9 +10,9 @@ repository = "https://github.com/wpbrown/bachelor"
 readme = "README.md"
 
 [dependencies]
-bitflags = "2"
-slab = "0.4.12"
-smallvec = "1"
+bitflags = "2.11"
+slab = "0.4"
+smallvec = "1.15"
 
 [dev-dependencies]
 futures-executor = "0.3"

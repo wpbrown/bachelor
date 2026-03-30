@@ -1,10 +1,11 @@
 use crate::core::RecvEffect;
 use crate::core::bounded_queue::BoundedQueue;
 use std::cell::{Cell, RefCell};
-use std::future::poll_fn;
+use std::future::Future;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Poll, Waker};
+use std::task::{Context, Poll, Waker};
 
 pub use crate::error::{Closed, TrySendError};
 
@@ -72,29 +73,11 @@ impl<T> SpscChannel<T> {
     }
 
     /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
-    pub async fn send(&self, item: T) -> Result<(), T> {
-        let mut item = Some(item);
-
-        poll_fn(|cx| {
-            let send_item = item.take().expect("send polled after completion");
-
-            match self.try_send(send_item) {
-                Ok(()) => {
-                    self.producer_waker.take();
-                    Poll::Ready(Ok(()))
-                }
-                Err(TrySendError::Closed(returned_item)) => {
-                    self.producer_waker.take();
-                    Poll::Ready(Err(returned_item))
-                }
-                Err(TrySendError::Full(returned_item)) => {
-                    item = Some(returned_item);
-                    self.producer_waker.set(Some(cx.waker().clone()));
-                    Poll::Pending
-                }
-            }
-        })
-        .await
+    pub fn send(&self, item: T) -> Send<'_, T> {
+        Send {
+            channel: self,
+            item: Some(item),
+        }
     }
 
     pub fn try_recv(&self) -> Result<Option<T>, Closed> {
@@ -119,20 +102,73 @@ impl<T> SpscChannel<T> {
     }
 
     /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
-    pub async fn recv(&self) -> Result<T, Closed> {
-        poll_fn(|cx| match self.try_recv() {
-            Ok(Some(item)) => Poll::Ready(Ok(item)),
-            Err(Closed) => Poll::Ready(Err(Closed)),
-            Ok(None) => {
-                self.consumer_waker.set(Some(cx.waker().clone()));
-                Poll::Pending
-            }
-        })
-        .await
+    pub fn recv(&self) -> Recv<'_, T> {
+        Recv { channel: self }
     }
 
     pub fn shrink_to_fit(&self) {
         self.queue.borrow_mut().shrink_to_fit();
+    }
+}
+
+pub struct Send<'a, T> {
+    channel: &'a SpscChannel<T>,
+    item: Option<T>,
+}
+
+/// `Send` only stores `T` by value and never creates a self-referential borrow.
+impl<T> Unpin for Send<'_, T> {}
+
+impl<T> Future for Send<'_, T> {
+    type Output = Result<(), T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let send_item = this.item.take().expect("Send polled after completion");
+
+        match this.channel.try_send(send_item) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(TrySendError::Closed(returned_item)) => Poll::Ready(Err(returned_item)),
+            Err(TrySendError::Full(returned_item)) => {
+                this.item = Some(returned_item);
+                this.channel.producer_waker.set(Some(cx.waker().clone()));
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl<T> Drop for Send<'_, T> {
+    fn drop(&mut self) {
+        if self.item.is_some() {
+            self.channel.producer_waker.take();
+        }
+    }
+}
+
+pub struct Recv<'a, T> {
+    channel: &'a SpscChannel<T>,
+}
+
+impl<T> Future for Recv<'_, T> {
+    type Output = Result<T, Closed>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.channel.try_recv() {
+            Ok(Some(item)) => Poll::Ready(Ok(item)),
+            Err(Closed) => Poll::Ready(Err(Closed)),
+            Ok(None) => {
+                this.channel.consumer_waker.set(Some(cx.waker().clone()));
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl<T> Drop for Recv<'_, T> {
+    fn drop(&mut self) {
+        self.channel.consumer_waker.take();
     }
 }
 
@@ -418,5 +454,38 @@ mod tests {
             producer.send(999).await.unwrap();
             assert_eq!(consumer.recv().await, Ok(999));
         });
+    }
+
+    #[test]
+    fn dropped_send_future_clears_waker() {
+        let ch = SpscChannel::new(nz(1));
+        assert_eq!(ch.try_send(1), Ok(()));
+
+        let mut send_fut = Box::pin(ch.send(2));
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(send_fut.as_mut().poll(&mut cx), Poll::Pending);
+        drop(send_fut);
+
+        // Waker was cleared by Drop, so close should not wake it.
+        ch.close();
+        assert_eq!(wake_count.get(), 0);
+    }
+
+    #[test]
+    fn dropped_recv_future_clears_waker() {
+        let ch = SpscChannel::<i32>::new(nz(2));
+
+        let mut recv_fut = Box::pin(ch.recv());
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(recv_fut.as_mut().poll(&mut cx), Poll::Pending);
+        drop(recv_fut);
+
+        // Waker was cleared by Drop, so close should not wake it.
+        ch.close();
+        assert_eq!(wake_count.get(), 0);
     }
 }

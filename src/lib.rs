@@ -41,6 +41,10 @@
 //! will never be woken. This is a correctness hazard, not a
 //! memory-safety issue.
 //!
+//! Each future clears its waker slot when dropped. Callers must
+//! therefore ensure a previous future is dropped before creating a new
+//! one for the same slot.
+//!
 //! Which methods are affected depends on the primitive. Each module's
 //! documentation lists the specific methods that carry this constraint.
 //!
