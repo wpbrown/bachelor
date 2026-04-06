@@ -1,6 +1,6 @@
 [package]
 name = "bachelor"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 description = "Pure single-threaded utilities optimized for thread-per-core executors"
 license = "MIT OR Apache-2.0"
@@ -9,8 +9,15 @@ categories = ["data-structures", "concurrency"]
 repository = "https://github.com/wpbrown/bachelor"
 readme = "README.md"
 
+[features]
+default = []
+sink = ["dep:futures-sink"]
+stream = ["dep:futures-core"]
+
 [dependencies]
 bitflags = "2.11"
+futures-core = { version = "0.3", optional = true }
+futures-sink = { version = "0.3", optional = true }
 slab = "0.4"
 smallvec = "1.15"
 

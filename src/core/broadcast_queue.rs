@@ -84,18 +84,25 @@ impl<T, C> BroadcastQueue<T, C> {
         &mut self.consumers[id.0].context
     }
 
-    pub fn try_send(&mut self, item: T) -> Result<(), T> {
+    pub fn can_send(&mut self) -> bool {
         if self.consumers.is_empty() {
             self.cached_min_cursor = self.tail;
             self.gc();
-            drop(item);
-            return Ok(());
+            return true;
         }
 
         self.gc();
+        self.buffer.len() < self.capacity.get()
+    }
 
-        if self.buffer.len() >= self.capacity.get() {
+    pub fn try_send(&mut self, item: T) -> Result<(), T> {
+        if !self.can_send() {
             return Err(item);
+        }
+
+        if self.consumers.is_empty() {
+            drop(item);
+            return Ok(());
         }
 
         self.buffer.push_back(item);

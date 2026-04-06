@@ -33,6 +33,44 @@
 //! Choose core types when you need control over allocation. Choose split
 //! handles when convenience and compile-time correctness matter more.
 //!
+//! # Optional `stream` and `sink` support
+//!
+//! Enable the `stream` cargo feature for `futures-core` `Stream` integration:
+//!
+//! - [`SpscChannelConsumer`](`channel::SpscChannelConsumer`) implements
+//!   `Stream<Item = T>`.
+//! - [`MpscChannelConsumer`](`channel::MpscChannelConsumer`) implements
+//!   `Stream<Item = T>`.
+//! - [`SpmcBroadcastConsumer`](`broadcast::SpmcBroadcastConsumer`) implements
+//!   `Stream<Item = T>` only when `T: Clone`.
+//!
+//! These streams yield buffered items first and then return `None` once the
+//! primitive is closed and drained. The matching core polling APIs are
+//! [`SpscChannel::poll_recv`](`channel::SpscChannel::poll_recv`) and
+//! [`MpscChannel::poll_recv`](`channel::MpscChannel::poll_recv`). Broadcast
+//! keeps its existing raw-key receive APIs; for non-clone payloads, use the
+//! visitor-based `recv_ref` path instead of `Stream`.
+//!
+//! Enable the `sink` cargo feature for `futures-sink` `Sink` integration with
+//! [`Closed`](`error::Closed`) as the error type:
+//!
+//! - [`SpscChannelProducer`](`channel::SpscChannelProducer`) implements `Sink<T>`.
+//! - [`SpmcBroadcastProducer`](`broadcast::SpmcBroadcastProducer`) implements
+//!   `Sink<T>`.
+//! - MPSC uses [`MpscChannelProducer::into_sink`](`channel::MpscChannelProducer::into_sink`)
+//!   to create an [`MpscChannelSink`](`channel::MpscChannelSink`), which then
+//!   implements `Sink<T>`.
+//!
+//! The matching core send-readiness APIs are
+//! [`SpscChannel::poll_ready_send`](`channel::SpscChannel::poll_ready_send`) and
+//! [`SpmcBroadcast::poll_ready_send`](`broadcast::SpmcBroadcast::poll_ready_send`).
+//! MPSC keeps sink waiter state in the split sink adaptor rather than on the
+//! core type. For SPSC and SPMC, `poll_flush` is immediate because there is
+//! no producer-side buffering beyond the channel queue itself. MPSC's
+//! [`MpscChannelSink`](`channel::MpscChannelSink`) holds a one-item buffer to
+//! avoid races between `poll_ready` and `start_send`, so its `poll_flush` may
+//! return `Pending` while draining that buffer.
+//!
 //! # Single-waker contract
 //!
 //! Some async methods in this crate register a single waker for their

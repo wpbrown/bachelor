@@ -2,6 +2,10 @@ use crate::core::RecvEffect;
 use crate::core::broadcast_queue::BroadcastQueue;
 use crate::core::broadcast_queue::ConsumerKey;
 use crate::error::{Closed, TryRecvRefError, TrySendError};
+#[cfg(feature = "stream")]
+use futures_core::Stream;
+#[cfg(feature = "sink")]
+use futures_sink::Sink;
 use smallvec::SmallVec;
 use std::future::Future;
 use std::pin::Pin;
@@ -125,6 +129,25 @@ impl<T> SpmcBroadcast<T> {
         Send {
             channel: self,
             item: Some(item),
+        }
+    }
+
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
+    ///
+    /// Returns `Poll::Ready(Err(Closed))` once the broadcast is closed.
+    ///
+    /// Readiness accounts for lagging consumers: this stays pending while the
+    /// slowest subscriber still keeps the bounded buffer full.
+    pub fn poll_ready_send(&self, cx: &mut Context<'_>) -> Poll<Result<(), Closed>> {
+        if self.closed.get() {
+            return Poll::Ready(Err(Closed));
+        }
+
+        if !self.queue.borrow_mut().can_send() {
+            self.producer_waker.set(Some(cx.waker().clone()));
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -370,6 +393,21 @@ impl<T: Clone> SpmcBroadcast<T> {
     pub fn recv_raw<'a, 'b>(&'a self, id: &'b mut SpmcBroadcastConsumerKey) -> Recv<'a, 'b, T> {
         Recv { channel: self, id }
     }
+
+    fn poll_recv_raw_result(
+        &self,
+        id: &mut SpmcBroadcastConsumerKey,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<T, Closed>> {
+        match self.try_recv_raw(id) {
+            Ok(Some(item)) => Poll::Ready(Ok(item)),
+            Err(Closed) => Poll::Ready(Err(Closed)),
+            Ok(None) => {
+                self.register_consumer_waker(id, cx.waker());
+                Poll::Pending
+            }
+        }
+    }
 }
 
 pub struct Recv<'a, 'b, T> {
@@ -385,14 +423,7 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        match this.channel.try_recv_raw(this.id) {
-            Ok(Some(item)) => Poll::Ready(Ok(item)),
-            Err(Closed) => Poll::Ready(Err(Closed)),
-            Ok(None) => {
-                this.channel.register_consumer_waker(this.id, cx.waker());
-                Poll::Pending
-            }
-        }
+        this.channel.poll_recv_raw_result(this.id, cx)
     }
 }
 
@@ -468,6 +499,19 @@ impl<T: Clone> SpmcBroadcastConsumer<T> {
     }
 }
 
+#[cfg(feature = "stream")]
+impl<T: Clone> Stream for SpmcBroadcastConsumer<T> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        this.inner
+            .channel
+            .poll_recv_raw_result(&mut this.id, cx)
+            .map(Result::ok)
+    }
+}
+
 impl<T> SpmcBroadcastSource<T> {
     pub fn subscribe(&self) -> SpmcBroadcastConsumer<T> {
         self.inner
@@ -513,6 +557,34 @@ impl<T> SpmcBroadcastProducer<T> {
     }
 }
 
+#[cfg(feature = "sink")]
+impl<T> Sink<T> for SpmcBroadcastProducer<T> {
+    type Error = Closed;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.get_mut().inner.channel.poll_ready_send(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+        match self.get_mut().inner.channel.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Closed(_)) => Err(Closed),
+            Err(TrySendError::Full(_)) => {
+                panic!("SpmcBroadcastProducer::start_send called without a preceding ready state")
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.get_mut().inner.channel.close();
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl<T> Drop for SpmcBroadcastProducer<T> {
     fn drop(&mut self) {
         self.inner.channel.close();
@@ -544,7 +616,11 @@ mod tests {
     use std::task::Context;
 
     use futures_executor::block_on;
+    #[cfg(feature = "sink")]
+    use futures_sink::Sink;
     use futures_test::task::new_count_waker;
+    #[cfg(feature = "stream")]
+    use futures_util::StreamExt;
     use futures_util::pin_mut;
 
     fn nz(n: usize) -> NonZeroUsize {
@@ -601,6 +677,26 @@ mod tests {
         channel.unsubscribe_raw(&consumer);
         assert_eq!(wake_count.get(), 1);
         assert_eq!(send_fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+    }
+
+    #[test]
+    fn poll_ready_send_pending_then_ready_after_recv() {
+        let channel = SpmcBroadcast::new(nz(1));
+        let consumer = channel.subscribe_raw();
+
+        assert_eq!(channel.try_send(1), Ok(()));
+
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(channel.poll_ready_send(&mut cx), Poll::Pending);
+        assert_eq!(wake_count.get(), 0);
+
+        assert_eq!(channel.try_recv_raw(&consumer), Ok(Some(1)));
+        assert_eq!(wake_count.get(), 1);
+
+        assert_eq!(channel.poll_ready_send(&mut cx), Poll::Ready(Ok(())));
+        channel.unsubscribe_raw(&consumer);
     }
 
     #[test]
@@ -899,6 +995,120 @@ mod tests {
         assert_eq!(consumer.try_recv(), Err(Closed));
     }
 
+    #[cfg(feature = "sink")]
+    #[test]
+    fn sink_poll_ready_pending_then_woken_by_recv() {
+        let (mut producer, source) = broadcast(nz(1));
+        let consumer = source.subscribe();
+
+        assert_eq!(producer.try_send(1), Ok(()));
+
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(Pin::new(&mut producer).poll_ready(&mut cx), Poll::Pending);
+        assert_eq!(wake_count.get(), 0);
+
+        assert_eq!(consumer.try_recv(), Ok(Some(1)));
+        assert_eq!(wake_count.get(), 1);
+
+        assert_eq!(
+            Pin::new(&mut producer).poll_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        );
+        assert_eq!(Pin::new(&mut producer).start_send(2), Ok(()));
+        assert_eq!(consumer.try_recv(), Ok(Some(2)));
+    }
+
+    #[cfg(feature = "sink")]
+    #[test]
+    fn sink_poll_ready_pending_then_woken_by_unsubscribe() {
+        let (mut producer, source) = broadcast(nz(1));
+        let lagger = source.subscribe();
+
+        assert_eq!(producer.try_send(1), Ok(()));
+
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(Pin::new(&mut producer).poll_ready(&mut cx), Poll::Pending);
+        assert_eq!(wake_count.get(), 0);
+
+        drop(lagger);
+        assert_eq!(wake_count.get(), 1);
+
+        assert_eq!(
+            Pin::new(&mut producer).poll_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        );
+        assert_eq!(Pin::new(&mut producer).start_send(2), Ok(()));
+    }
+
+    #[cfg(feature = "sink")]
+    #[test]
+    fn sink_flush_is_immediately_ready() {
+        let (mut producer, source) = broadcast(nz(2));
+        let consumer = source.subscribe();
+
+        let (waker, _wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(
+            Pin::new(&mut producer).poll_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        );
+        assert_eq!(Pin::new(&mut producer).start_send(9), Ok(()));
+        assert_eq!(
+            Pin::new(&mut producer).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        );
+
+        assert_eq!(consumer.try_recv(), Ok(Some(9)));
+    }
+
+    #[cfg(feature = "sink")]
+    #[test]
+    fn sink_close_wakes_pending_recv() {
+        let (mut producer, source) = broadcast::<i32>(nz(2));
+        let mut consumer = source.subscribe();
+
+        let mut recv_fut = Box::pin(consumer.recv());
+        let (recv_waker, recv_wake_count) = new_count_waker();
+        let mut recv_cx = Context::from_waker(&recv_waker);
+
+        assert_eq!(recv_fut.as_mut().poll(&mut recv_cx), Poll::Pending);
+        assert_eq!(recv_wake_count.get(), 0);
+
+        let (sink_waker, _sink_wake_count) = new_count_waker();
+        let mut sink_cx = Context::from_waker(&sink_waker);
+
+        assert_eq!(
+            Pin::new(&mut producer).poll_close(&mut sink_cx),
+            Poll::Ready(Ok(()))
+        );
+        assert_eq!(recv_wake_count.get(), 1);
+        assert_eq!(
+            recv_fut.as_mut().poll(&mut recv_cx),
+            Poll::Ready(Err(Closed))
+        );
+    }
+
+    #[cfg(feature = "sink")]
+    #[test]
+    fn sink_ready_and_start_send_return_closed_after_close() {
+        let (mut producer, source) = broadcast::<i32>(nz(2));
+        drop(source);
+
+        let (waker, _wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(
+            Pin::new(&mut producer).poll_ready(&mut cx),
+            Poll::Ready(Err(Closed))
+        );
+        assert_eq!(Pin::new(&mut producer).start_send(5), Err(Closed));
+    }
+
     #[test]
     fn double_close_is_idempotent() {
         let channel = SpmcBroadcast::<i32>::new(nz(2));
@@ -972,5 +1182,85 @@ mod tests {
             let val = consumer.recv_ref(|_: &NoCopy| ()).await;
             assert_eq!(val, Err(Closed));
         });
+    }
+
+    #[cfg(feature = "stream")]
+    #[test]
+    fn stream_pending_then_woken_by_send() {
+        let (producer, source) = broadcast(nz(2));
+        let mut consumer = source.subscribe();
+
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(Pin::new(&mut consumer).poll_next(&mut cx), Poll::Pending);
+        assert_eq!(wake_count.get(), 0);
+
+        assert_eq!(producer.try_send(7), Ok(()));
+        assert_eq!(wake_count.get(), 1);
+
+        assert_eq!(
+            Pin::new(&mut consumer).poll_next(&mut cx),
+            Poll::Ready(Some(7))
+        );
+    }
+
+    #[cfg(feature = "stream")]
+    #[test]
+    fn stream_drains_then_returns_none_after_close() {
+        let (producer, source) = broadcast(nz(4));
+        let mut consumer = source.subscribe();
+
+        assert_eq!(producer.try_send(1), Ok(()));
+        assert_eq!(producer.try_send(2), Ok(()));
+        drop(producer);
+
+        block_on(async {
+            assert_eq!(consumer.next().await, Some(1));
+            assert_eq!(consumer.next().await, Some(2));
+            assert_eq!(consumer.next().await, None);
+        });
+    }
+
+    #[cfg(feature = "stream")]
+    #[test]
+    fn stream_yields_each_item_to_each_consumer() {
+        let (producer, source) = broadcast(nz(4));
+        let mut a = source.subscribe();
+        let mut b = source.subscribe();
+
+        assert_eq!(producer.try_send(3), Ok(()));
+        assert_eq!(producer.try_send(4), Ok(()));
+        drop(producer);
+
+        block_on(async {
+            assert_eq!(a.next().await, Some(3));
+            assert_eq!(a.next().await, Some(4));
+            assert_eq!(a.next().await, None);
+        });
+
+        block_on(async {
+            assert_eq!(b.next().await, Some(3));
+            assert_eq!(b.next().await, Some(4));
+            assert_eq!(b.next().await, None);
+        });
+    }
+
+    #[cfg(feature = "stream")]
+    #[test]
+    fn dropped_stream_consumer_clears_waker_slot() {
+        let (producer, source) = broadcast::<i32>(nz(2));
+        let mut consumer = source.subscribe();
+
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(Pin::new(&mut consumer).poll_next(&mut cx), Poll::Pending);
+        assert_eq!(wake_count.get(), 0);
+
+        drop(consumer);
+
+        assert_eq!(producer.try_send(1), Ok(()));
+        assert_eq!(wake_count.get(), 0);
     }
 }
