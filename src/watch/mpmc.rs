@@ -195,9 +195,16 @@ impl<T> Drop for MpmcWatchRefProducer<T> {
     }
 }
 
-#[derive(Clone)]
 pub struct MpmcWatchRefSource<T> {
     inner: Rc<Inner<T>>,
+}
+
+impl<T> Clone for MpmcWatchRefSource<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
+    }
 }
 
 impl<T> MpmcWatchRefSource<T> {
