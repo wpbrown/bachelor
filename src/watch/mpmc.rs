@@ -1,9 +1,12 @@
 use crate::error::Closed;
 use crate::signal::mpmc_finite_latched::{
-    self, MpmcFiniteLatchedSignal, MpmcFiniteLatchedSignalConsumerKey,
+    MpmcFiniteLatchedSignal, MpmcFiniteLatchedSignalConsumerKey, Wait as MpmcFiniteLatchedWait,
 };
 use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
 /// Per-consumer observation state for [`MpmcWatchRef`].
 ///
@@ -112,8 +115,8 @@ impl<T> MpmcWatchRef<T> {
     pub fn observe<'a, 'b>(
         &'a self,
         key: &'b mut MpmcWatchRefConsumerKey,
-    ) -> mpmc_finite_latched::Wait<'a, 'b> {
-        self.signal.observe(&mut key.0)
+    ) -> MpmcWatchRefObserver<'a, 'b> {
+        MpmcWatchRefObserver(self.signal.observe(&mut key.0))
     }
 
     pub fn shrink_to_fit(&self) {
@@ -131,6 +134,16 @@ impl<T> Inner<T> {
     /// assuming `self` is about to be dropped by one of them.
     fn receiver_count_after_drop(self: &Rc<Self>) -> usize {
         Rc::strong_count(self) - 1 - self.producer_count.get()
+    }
+}
+
+pub struct MpmcWatchRefObserver<'a, 'b>(MpmcFiniteLatchedWait<'a, 'b>);
+
+impl Future for MpmcWatchRefObserver<'_, '_> {
+    type Output = Result<(), Closed>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx)
     }
 }
 
@@ -239,8 +252,8 @@ pub struct MpmcWatchRefConsumer<T> {
 }
 
 impl<T> MpmcWatchRefConsumer<T> {
-    pub async fn changed(&mut self) -> Result<(), Closed> {
-        self.inner.watch.observe(&mut self.key).await
+    pub fn changed(&mut self) -> MpmcWatchRefObserver<'_, '_> {
+        self.inner.watch.observe(&mut self.key)
     }
 
     pub fn is_closed(&self) -> bool {
