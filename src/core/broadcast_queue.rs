@@ -84,6 +84,10 @@ impl<T, C> BroadcastQueue<T, C> {
         &mut self.consumers[id.0].context
     }
 
+    pub fn can_recv(&self, id: ConsumerKey) -> bool {
+        self.consumers[id.0].cursor < self.tail
+    }
+
     pub fn can_send(&mut self) -> bool {
         if self.consumers.is_empty() {
             self.cached_min_cursor = self.tail;
@@ -298,6 +302,21 @@ mod tests {
 
         q.consumer_context_mut(c).push_str("-beta");
         assert_eq!(q.consumer_context_mut(c).as_str(), "alpha-beta");
+    }
+
+    #[test]
+    fn can_recv_does_not_advance_consumer() {
+        let mut q = new_queue(4);
+        let c = sub(&mut q);
+
+        assert!(!q.can_recv(c));
+
+        assert_eq!(q.try_send(1), Ok(()));
+        assert!(q.can_recv(c));
+        assert!(q.can_recv(c));
+
+        assert_eq!(q.try_recv(c), Some((1, RecvEffect::NoChange)));
+        assert!(!q.can_recv(c));
     }
 
     #[test]

@@ -279,6 +279,48 @@ impl<T> SpmcBroadcast<T> {
             visitor: Some(visitor),
         }
     }
+
+    /// Waits until a raw consumer subscription has an item available without
+    /// advancing its cursor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is stale, already unsubscribed, or did not come
+    /// from a live subscription on this broadcast.
+    /// See the crate-level documentation on the [raw consumer key
+    /// contract](crate#user-managed-consumer-state).
+    ///
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
+    pub fn ready_raw<'a, 'b>(&'a self, id: &'b mut SpmcBroadcastConsumerKey) -> Ready<'a, 'b, T> {
+        Ready { channel: self, id }
+    }
+
+    /// Callers must uphold the [single-waker contract](crate#single-waker-contract).
+    ///
+    /// Returns `Poll::Ready(Ok(()))` when `id` has an item available without
+    /// advancing its cursor. Returns `Poll::Ready(Err(Closed))` once the
+    /// broadcast is closed and `id` has no buffered item available.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is stale, already unsubscribed, or did not come
+    /// from a live subscription on this broadcast.
+    /// See the crate-level documentation on the [raw consumer key
+    /// contract](crate#user-managed-consumer-state).
+    pub fn poll_ready_recv(
+        &self,
+        id: &mut SpmcBroadcastConsumerKey,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Closed>> {
+        if self.queue.borrow().can_recv(id.0) {
+            Poll::Ready(Ok(()))
+        } else if self.closed.get() {
+            Poll::Ready(Err(Closed))
+        } else {
+            self.register_consumer_waker(id, cx.waker());
+            Poll::Pending
+        }
+    }
 }
 
 pub struct Send<'a, T> {
@@ -348,6 +390,26 @@ where
 }
 
 impl<T, F> Drop for RecvRef<'_, '_, T, F> {
+    fn drop(&mut self) {
+        self.channel.clear_consumer_waker(self.id);
+    }
+}
+
+pub struct Ready<'a, 'b, T> {
+    channel: &'a SpmcBroadcast<T>,
+    id: &'b mut SpmcBroadcastConsumerKey,
+}
+
+impl<T> Future for Ready<'_, '_, T> {
+    type Output = Result<(), Closed>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.channel.poll_ready_recv(this.id, cx)
+    }
+}
+
+impl<T> Drop for Ready<'_, '_, T> {
     fn drop(&mut self) {
         self.channel.clear_consumer_waker(self.id);
     }
@@ -454,6 +516,11 @@ impl<'a, T> SpmcBroadcastConsumerRef<'a, T> {
     pub async fn recv_ref<R>(&mut self, visitor: impl FnOnce(&T) -> R) -> Result<R, Closed> {
         self.channel.recv_ref_raw(&mut self.id, visitor).await
     }
+
+    /// See [`SpmcBroadcast::ready_raw`] for details.
+    pub fn ready(&mut self) -> Ready<'_, '_, T> {
+        self.channel.ready_raw(&mut self.id)
+    }
 }
 
 impl<'a, T: Clone> SpmcBroadcastConsumerRef<'a, T> {
@@ -486,6 +553,11 @@ impl<T> SpmcBroadcastConsumer<T> {
     /// Panics if `visitor` re-entrantly borrows this channel.
     pub async fn recv_ref<R>(&mut self, visitor: impl FnOnce(&T) -> R) -> Result<R, Closed> {
         self.inner.channel.recv_ref_raw(&mut self.id, visitor).await
+    }
+
+    /// See [`SpmcBroadcast::ready_raw`] for details.
+    pub fn ready(&mut self) -> Ready<'_, '_, T> {
+        self.inner.channel.ready_raw(&mut self.id)
     }
 }
 
@@ -643,6 +715,93 @@ mod tests {
         assert_eq!(wake_count.get(), 1);
 
         assert_eq!(recv_fut.as_mut().poll(&mut cx), Poll::Ready(Ok(7)));
+    }
+
+    #[test]
+    fn ready_waiter_woken_by_send_without_receiving() {
+        let channel = SpmcBroadcast::new(nz(2));
+        let mut consumer = channel.subscribe_raw();
+
+        let mut ready_fut = Box::pin(channel.ready_raw(&mut consumer));
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(ready_fut.as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(wake_count.get(), 0);
+
+        assert_eq!(channel.try_send(7), Ok(()));
+        assert_eq!(wake_count.get(), 1);
+
+        assert_eq!(ready_fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(ready_fut);
+
+        assert_eq!(channel.try_recv_raw(&consumer), Ok(Some(7)));
+        channel.unsubscribe_raw(&consumer);
+    }
+
+    #[test]
+    fn poll_ready_recv_pending_then_ready_after_send_without_receiving() {
+        let channel = SpmcBroadcast::new(nz(2));
+        let mut consumer = channel.subscribe_raw();
+
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(
+            channel.poll_ready_recv(&mut consumer, &mut cx),
+            Poll::Pending
+        );
+        assert_eq!(wake_count.get(), 0);
+
+        assert_eq!(channel.try_send(7), Ok(()));
+        assert_eq!(wake_count.get(), 1);
+
+        assert_eq!(
+            channel.poll_ready_recv(&mut consumer, &mut cx),
+            Poll::Ready(Ok(()))
+        );
+        assert_eq!(channel.try_recv_raw(&consumer), Ok(Some(7)));
+        channel.unsubscribe_raw(&consumer);
+    }
+
+    #[test]
+    fn ready_does_not_unblock_full_queue() {
+        let channel = SpmcBroadcast::new(nz(1));
+        let mut consumer = channel.subscribe_raw();
+
+        assert_eq!(channel.try_send(1), Ok(()));
+
+        let mut ready_fut = Box::pin(channel.ready_raw(&mut consumer));
+        let (waker, _wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(ready_fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(ready_fut);
+
+        assert_eq!(channel.try_send(2), Err(TrySendError::Full(2)));
+        assert_eq!(channel.try_recv_raw(&consumer), Ok(Some(1)));
+        assert_eq!(channel.try_send(2), Ok(()));
+        channel.unsubscribe_raw(&consumer);
+    }
+
+    #[test]
+    fn ready_waiter_woken_by_close() {
+        let channel = SpmcBroadcast::<i32>::new(nz(2));
+        let mut consumer = channel.subscribe_raw();
+
+        let mut ready_fut = Box::pin(channel.ready_raw(&mut consumer));
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(ready_fut.as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(wake_count.get(), 0);
+
+        channel.close();
+        assert_eq!(wake_count.get(), 1);
+
+        assert_eq!(ready_fut.as_mut().poll(&mut cx), Poll::Ready(Err(Closed)));
+        drop(ready_fut);
+        channel.unsubscribe_raw(&consumer);
     }
 
     #[test]
@@ -886,6 +1045,27 @@ mod tests {
         let consumer = source.subscribe();
 
         assert!(producer.try_send(NoCopy(vec![1, 2])).is_ok());
+
+        let val = consumer.try_recv_ref(|item| item.0.clone());
+        assert_eq!(val.ok(), Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn consumer_owned_ready_no_clone() {
+        let (producer, source) = broadcast(nz(2));
+        let mut consumer = source.subscribe();
+
+        let mut ready_fut = Box::pin(consumer.ready());
+        let (waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(ready_fut.as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(wake_count.get(), 0);
+
+        assert!(producer.try_send(NoCopy(vec![1, 2])).is_ok());
+        assert_eq!(wake_count.get(), 1);
+        assert_eq!(ready_fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(ready_fut);
 
         let val = consumer.try_recv_ref(|item| item.0.clone());
         assert_eq!(val.ok(), Some(vec![1, 2]));
